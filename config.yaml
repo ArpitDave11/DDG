@@ -1,0 +1,20 @@
+
+azure:
+  blob_connection_string: "<AZURE_STORAGE_CONNECTION_STRING>"
+  blob_container: "<METADATA_CONTAINER_NAME>"
+  openai_endpoint: "https://<YOUR_OPENAI_RESOURCE>.openai.azure.com/"
+  openai_api_key: "<AZURE_OPENAI_API_KEY>"
+  openai_api_version: "2024-02-01"        # API version for Azure OpenAI
+  openai_deployment_gpt4: "<GPT4_DEPLOYMENT_NAME>"   # fine-tuned GPT-4 deployment
+  openai_deployment_embed: "<EMBEDDING_DEPLOYMENT_NAME>"  # e.g., text-embedding-ada-002 deployment
+postgres:
+  host: "<DB_HOST>"
+  port: 5432
+  database: "<DB_NAME>"
+  user: "<DB_USER>"
+  password: "<DB_PASSWORD>"
+  sslmode: "require"   # or "prefer"/"disable" based on your setup
+settings:
+  top_k: 3             # number of similar examples to retrieve
+  max_tokens: 256      # max tokens for generated description
+  temperature: 0.2     # generation creativity
