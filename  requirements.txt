@@ -1,0 +1,8 @@
+azure-storage-blob
+openai
+faiss-cpu
+psycopg2-binary
+fastapi
+uvicorn[standard]
+pyyaml
+numpy
