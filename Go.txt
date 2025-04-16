@@ -1,0 +1,227 @@
+PART 1: Round Robin VM Selection
+
+Overview
+Your goal is to distribute tasks evenly by not always choosing the first VM (VM1). Instead, implement a round-robin (or random) method that pings each VM in sequence until one is reachable. This avoids overloading a single machine.
+
+Suggested User Story
+Title: Distributed Task Execution via Round Robin VM Selection
+
+As a system administrator,
+I want the system to select VMs in a round-robin (or random) manner with a connectivity check (ping test),
+so that tasks are evenly distributed among available VMs and no single VM is overloaded.
+
+Acceptance Criteria
+VM Selection:
+The system maintains a list of VMs.
+When a task is initiated, the next VM in the list is tested first.
+If the chosen VM passes a ping test, it is used for processing.
+If the ping fails, the system moves to the next VM in the list (cycling through until a reachable VM is found).
+If no VMs are reachable, an appropriate error or fallback is triggered.
+Load Balancing:
+Over time, tasks are spread roughly equally across all VMs.
+Sample Code (Python)
+Below is a sample Python class implementing round-robin VM selection with a ping test. This code uses the subprocess module for a simple ping and cycles through the VM list.
+
+import subprocess
+import platform
+
+class VMSelector:
+    def __init__(self, vm_list):
+        self.vm_list = vm_list
+        self.current_index = 0  # Keeps track of the next VM to try
+
+    def ping_vm(self, vm_ip):
+        """
+        Ping the VM to check if it is reachable.
+        Uses different options for Windows and Unix-based systems.
+        """
+        param = "-n" if platform.system().lower() == "windows" else "-c"
+        try:
+            subprocess.check_output(["ping", param, "1", vm_ip], stderr=subprocess.STDOUT)
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    def get_next_vm(self):
+        """
+        Implements round-robin selection.
+        Iterates through the list starting from current index until a reachable VM is found.
+        """
+        total_vms = len(self.vm_list)
+        attempts = 0
+        while attempts < total_vms:
+            vm = self.vm_list[self.current_index]
+            # Update index for the next call (circular behavior)
+            self.current_index = (self.current_index + 1) % total_vms
+            if self.ping_vm(vm):
+                return vm
+            attempts += 1
+        return None  # No reachable VM found
+
+# Example usage:
+if __name__ == "__main__":
+    vm_list = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]  # Replace these with your VM IP addresses or hostnames
+    selector = VMSelector(vm_list)
+    selected_vm = selector.get_next_vm()
+    if selected_vm:
+        print("Selected VM:", selected_vm)
+    else:
+        print("No reachable VM found.")
+Deployment Note:
+You can wrap this functionality in an Azure Function triggered by a new task request. Store the current VM index in a persistent store (like Azure Table Storage or Cosmos DB) if you need to maintain state across function invocations.
+PART 2: Autosys Job Status Failures (Delta Lake State Table)
+
+Overview
+Currently, if a job fails to update Autosys, that failure is lost. The proposed change is to log every job execution (with job ID, filename, timestamp, status, and an “autosys update flag”) into a Delta Lake table. Only records with the flag set to “NO” are reprocessed.
+
+Suggested User Story
+Title: Ensure Reliable Autosys Job Status Updates via Persistent State
+
+As a DevOps engineer,
+I want each job to log its execution details (including whether it has been updated in Autosys) into a persistent Delta Lake table,
+so that no Autosys status update is permanently lost and failed updates can be retried.
+
+Acceptance Criteria
+Job Logging:
+When a job completes, the system logs the following into a Delta Lake table:
+File name / job ID
+Execution timestamp
+Status (e.g., success or failure)
+Autosys update flag (default to “NO”)
+Only jobs with autosys update flag “NO” are picked up on subsequent update runs.
+Fault Tolerance:
+Failed updates to Autosys remain logged, and the system continues to retry until a successful update occurs.
+Integration:
+The logging mechanism seamlessly integrates with existing job execution flows.
+Sample Code (Logging via Delta Lake using PySpark)
+Below is a sample class for logging job statuses to a Delta table. (This sample assumes you are running in an Azure Databricks notebook or any environment where PySpark and Delta Lake are set up.)
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, lit
+
+class JobLogger:
+    def __init__(self, delta_table_path):
+        self.delta_table_path = delta_table_path
+        self.spark = SparkSession.builder.appName("JobLogger").getOrCreate()
+        
+    def log_job(self, job_id, file_name, status):
+        """
+        Log a job execution to the Delta table with:
+          - job_id
+          - file_name
+          - status (success/failure)
+          - autosys_update_flag (default "NO")
+          - timestamp
+        """
+        # Create a DataFrame for the new job record
+        data = [(job_id, file_name, status, "NO")]
+        columns = ["job_id", "file_name", "status", "autosys_update_flag"]
+        df = self.spark.createDataFrame(data, columns)
+        df = df.withColumn("timestamp", current_timestamp())
+        
+        # Append the record to the Delta table
+        df.write.format("delta").mode("append").save(self.delta_table_path)
+        print(f"Logged job {job_id} to Delta table at {self.delta_table_path}")
+
+# Example usage:
+if __name__ == "__main__":
+    # Adjust the Delta table path as needed (e.g., DBFS path or Azure Storage account)
+    delta_path = "dbfs:/mnt/delta/job_status"
+    logger = JobLogger(delta_path)
+    logger.log_job("job_123", "file_abc.json", "success")
+Deployment Note:
+Set up the Delta table (if not already present) using Azure Databricks. You can schedule this logging script to run as part of your job execution pipeline.
+PART 3: Delta Table Logging & Notification Enhancement (Autosys Updater)
+
+Overview
+Instead of relying on a folder of JSON files for notification, the new process reads entries from the Delta table where the autosys update flag is “NO”. It then attempts to update Autosys and, upon a successful update, marks the record as updated.
+
+Suggested User Story
+Title: Automated Autosys Status Update via Delta Table Polling
+
+As an operations engineer,
+I want the Autosys updater to read pending job updates directly from the Delta table and update the flag upon successful update,
+so that there is an auditable and reliable process for ensuring job status synchronization with Autosys.
+
+Acceptance Criteria
+Delta Table Query:
+The updater reads from the Delta table and filters for records with autosys_update_flag = "NO".
+Autosys Update Logic:
+For each pending record, the updater calls the Autosys update API (or relevant integration).
+Upon successful update, the record’s autosys_update_flag is updated to “YES”.
+Fault Tolerance and Logging:
+Failures are logged and remain in the table for future reprocessing.
+The process repeats on a schedule (e.g., every 15 minutes) to catch missed updates.
+Sample Code (Autosys Updater Using Delta Lake)
+This sample demonstrates reading pending records, processing each one, and updating the Delta table using the DeltaTable API:
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import lit
+from delta.tables import DeltaTable
+
+class AutosysUpdater:
+    def __init__(self, delta_table_path):
+        self.delta_table_path = delta_table_path
+        self.spark = SparkSession.builder.appName("AutosysUpdater").getOrCreate()
+    
+    def get_pending_updates(self):
+        """
+        Read the Delta table and filter for records where autosys_update_flag is "NO".
+        """
+        df = self.spark.read.format("delta").load(self.delta_table_path)
+        pending_df = df.filter(df.autosys_update_flag == "NO")
+        return pending_df
+
+    def send_to_autosys(self, job_id):
+        """
+        Placeholder for the logic to update the job status in Autosys.
+        Replace this with the actual API call or integration code.
+        Returns True if the update was successful, else False.
+        """
+        # Simulate an update call to Autosys
+        print(f"Updating Autosys for job: {job_id}")
+        return True
+
+    def update_autosys_status(self):
+        """
+        Process pending jobs: for each record with autosys_update_flag == "NO", attempt to update Autosys.
+        If successful, update the Delta table record (set flag to "YES").
+        """
+        pending_df = self.get_pending_updates()
+        pending_jobs = pending_df.collect()
+        
+        deltaTable = DeltaTable.forPath(self.spark, self.delta_table_path)
+        
+        for row in pending_jobs:
+            job_id = row.job_id
+            if self.send_to_autosys(job_id):
+                # Update the flag in the Delta table to "YES" for this job_id
+                condition = f"job_id = '{job_id}'"
+                deltaTable.update(condition=condition, set={"autosys_update_flag": lit("YES")})
+                print(f"Job {job_id} marked as updated in Delta table.")
+            else:
+                print(f"Failed to update Autosys for job {job_id}; will retry later.")
+        print("Autosys update process complete.")
+
+# Example usage:
+if __name__ == "__main__":
+    delta_path = "dbfs:/mnt/delta/job_status"
+    updater = AutosysUpdater(delta_path)
+    updater.update_autosys_status()
+Deployment Note:
+This updater can be scheduled as an Azure Databricks job or as a separate Azure Function that triggers every 15 minutes. Ensure that your environment has the Delta Lake libraries installed and configured.
+Final Notes
+
+Azure Integration:
+• For the VM selection, you might deploy the Python script in an Azure Function or a container managed by Azure Kubernetes Service.
+• For job logging and Autosys updates, Azure Databricks provides a robust environment to run PySpark jobs with Delta Lake. The Delta tables can be stored on Azure Data Lake Storage or Azure Blob Storage.
+Persistence:
+Consider persisting state (such as the current VM index for round-robin selection) in Azure storage solutions (Azure Table Storage or Cosmos DB) if your service is stateless across deployments.
+Testing & Scaling:
+Run tests for each part individually (ping tests, job logging, and updater logic) in a development environment before rolling out to production to ensure fault tolerance and performance.
+This design provides a clear separation of concerns:
+
+VMSelector Service: Handles load distribution.
+JobLogger Service: Manages state persistence of job executions.
+AutosysUpdater Service: Processes pending job updates from the Delta table.
+This approach should meet your requirements and improve both load balancing and fault tolerance for Autosys status updates in your Azure environment.
