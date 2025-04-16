@@ -1,5 +1,80 @@
 PART 1: Round Robin VM Selection
 
+Current State:
+The system always selects the first VM (VM1) from the list to execute a task.
+It performs a "ping test" on this VM.
+If the test passes, it stops and uses this VM.
+This means almost all tasks (99–100%) are always run on VM1.
+Problem:
+This leads to load imbalance:
+VM1 is overloaded, while others (VM2, VM3, etc.) are underutilized.
+Required Change:
+Implement round-robin or random-based VM selection.
+Script should:
+Pick any VM from the list.
+Perform a ping test.
+If the VM is reachable:
+Proceed with it.
+If not reachable:
+Move to the next VM in the list using round-robin or random logic.
+What You Want:
+A Python script that:
+
+Selects VMs in a round-robin manner.
+Performs a ping test.
+Uses the first reachable VM.
+Distributes load across all VMs.
+Also, you want a user story and acceptance criteria for this implementation.
+PART 2: Autosys Job Status Failures
+
+Current System:
+Jobs run every 15 minutes.
+On each run:
+It checks jobs that ran in the previous 15 minutes.
+Updates Autosys with their success/failure status.
+Problem:
+If a job fails to update Autosys at 8:45 AM:
+The 9:00 AM job won’t retry the 8:45 AM failure.
+It only checks jobs from 8:45 to 9:00 AM.
+This leads to missed updates being lost permanently.
+There is no persistent state to track which jobs were successfully updated in Autosys.
+Required Change:
+Introduce a state table (preferably using Delta Lake).
+For each job execution:
+Log:
+File name / job ID
+Execution timestamp
+Status (success/failure)
+"Autosys update flag" (initially NO)
+Only entries with autosys update = NO should be picked for the next update.
+This helps prevent missed jobs and improves fault tolerance.
+PART 3: Delta Table Logging & Notification Enhancement
+
+Additional Behavior Required:
+Currently, whenever a job completes (success or failure):
+The system puts a JSON file into a notification folder.
+Enhancement Needed:
+Extend this behavior to also write an entry into a Delta table.
+Each Entry Must Include:
+File name / Job ID
+Status (success/failure)
+Autosys update flag (default to NO)
+Date / Timestamp
+Autosys Updater Program:
+
+Current Logic:
+It reads files from the notification folder to check for updates.
+New Logic (Required):
+Replace folder-based logic with Delta table reading:
+Read from the Delta table instead of folder.
+Filter entries where autosys update flag = NO.
+Attempt to update Autosys.
+If successful, update the flag in Delta table to YES.
+
+
+
+######PART 1: Round Robin VM Selection
+
 Overview
 Your goal is to distribute tasks evenly by not always choosing the first VM (VM1). Instead, implement a round-robin (or random) method that pings each VM in sequence until one is reachable. This avoids overloading a single machine.
 
