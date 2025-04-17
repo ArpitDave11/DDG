@@ -1,0 +1,153 @@
+PART 1: Round Robin VM Selection
+
+Current Issue:
+Currently, the VM selection process always picks the first VM from the list. This causes VM1 to be overloaded and under-utilizes other VMs.
+
+Required Changes (Round Robin Selection):
+
+Implement a round-robin approach to evenly distribute tasks among VMs.
+Each task selects a different VM sequentially.
+Perform a ping test and only choose the VM if it passes the test; otherwise, try the next VM in sequence.
+Recommended Python Logic (Enhanced):
+
+import itertools
+
+# Assume vm_list = ["vm1", "vm2", "vm3", ...]
+round_robin_vms = itertools.cycle(vm_list)
+
+def select_reachable_vm(vm_list):
+    for _ in range(len(vm_list)):
+        vm = next(round_robin_vms)
+        ip_address, nic_name = ping_test(vm)  # enhanced to ping test individual VM
+        if ip_address and nic_name:
+            print(f"Selected VM: {vm} (IP: {ip_address})")
+            return vm, ip_address, nic_name
+    raise Exception("No reachable VM found.")
+
+# Usage:
+selected_vm, ip_address, nic_name = select_reachable_vm(vm_list)
+📋 User Story (Round Robin VM Selection):
+AS A Databricks Autosys orchestrator,
+I WANT TO distribute workloads evenly across available VMs using round-robin selection,
+SO THAT I prevent overload of individual VMs and maximize infrastructure utilization.
+📝 Acceptance Criteria:
+Tasks select VMs in sequential round-robin fashion.
+Only reachable VMs (via ping test) are selected.
+If a VM fails ping test, the next VM is selected automatically.
+Each VM has approximately equal task distribution over time.
+✅ PART 2: Autosys Job Status Failures (Persistent State with Delta Table)
+
+Current Issue:
+Jobs run every 15 mins and only check the last 15-minutes window. If a job update is missed, it's permanently lost.
+
+Recommended Changes:
+
+Implement a Delta Lake state table to persistently track job executions and Autosys updates.
+Store and maintain execution status and Autosys update status persistently.
+Recommended Delta Lake Schema:
+
+Column	Type	Example
+file_name	string	data_file_001.csv
+job_id	string	WMA_ESL_5481_PROD...
+execution_timestamp	timestamp	2025-04-16 09:00:00
+status	string	SUCCESS / FAILURE
+autosys_update_flag	string (YES/NO)	NO initially
+Logic Example:
+
+from delta.tables import DeltaTable
+from pyspark.sql.functions import current_timestamp
+
+# Example: logging job execution
+def log_job_execution(file_name, job_id, status):
+    spark.sql(f"""
+        INSERT INTO delta.autosys_job_log
+        VALUES ('{file_name}', '{job_id}', current_timestamp(), '{status}', 'NO')
+    """)
+
+# Updating Autosys flag after successful update
+def update_autosys_flag(file_name, job_id):
+    spark.sql(f"""
+        UPDATE delta.autosys_job_log
+        SET autosys_update_flag = 'YES'
+        WHERE file_name = '{file_name}' AND job_id = '{job_id}'
+    """)
+
+# Fetch unprocessed job updates
+def fetch_unprocessed_updates():
+    return spark.sql("""
+        SELECT * FROM delta.autosys_job_log
+        WHERE autosys_update_flag = 'NO'
+    """).collect()
+📋 User Story (Autosys Job Status Persistence):
+AS AN Autosys system manager,
+I WANT TO persistently track job status updates using a Delta table,
+SO THAT missed updates are not permanently lost and can be retried reliably.
+📝 Acceptance Criteria:
+Every job execution is logged into a Delta table.
+Only entries flagged as autosys_update_flag = NO are processed for updates.
+Successfully updated entries set the flag to YES.
+Failed or missed updates remain available for retry in the next cycle.
+✅ PART 3: Delta Table Logging & Notification Enhancement
+
+Current Issue:
+Notification updates currently rely on writing JSON files into a folder. This limits persistence, querying, and reliable updates.
+
+Recommended Changes:
+
+Use a Delta table instead of JSON files for notification logging.
+Autosys updater reads directly from the Delta table.
+Autosys updates the Delta table entry upon successful notification.
+Enhanced Delta Table Schema:
+
+Column	Type	Example
+file_name	string	data_file_001.csv
+job_id	string	WMA_ESL_5481_PROD...
+status	string	SUCCESS / FAILURE
+autosys_update_flag	string (YES/NO)	NO initially
+notification_timestamp	timestamp	2025-04-16 09:01:05
+Implementation Steps:
+
+Step 1: Logging Job Completion
+
+def log_job_completion(file_name, job_id, status):
+    spark.sql(f"""
+        INSERT INTO delta.job_notifications
+        VALUES ('{file_name}', '{job_id}', '{status}', 'NO', current_timestamp())
+    """)
+Step 2: Autosys Updater Logic
+
+def autosys_update_runner():
+    df_pending = spark.sql("""
+        SELECT * FROM delta.job_notifications
+        WHERE autosys_update_flag = 'NO'
+    """)
+    
+    for row in df_pending.collect():
+        success = send_autosys_update(row.file_name, row.job_id, row.status)
+        if success:
+            spark.sql(f"""
+                UPDATE delta.job_notifications
+                SET autosys_update_flag = 'YES'
+                WHERE file_name = '{row.file_name}' AND job_id = '{row.job_id}'
+            """)
+📋 User Story (Delta Table Notification & Updates):
+AS AN Autosys job operator,
+I WANT TO log job notifications to a Delta table and update Autosys statuses from it,
+SO THAT I achieve robust notification management and eliminate unreliable file-based methods.
+📝 Acceptance Criteria:
+All notifications logged immediately in a Delta table.
+Autosys updater fetches notifications only from the Delta table.
+Notification entries with successful Autosys updates flagged YES.
+Any failures remain flagged NO for retries.
+🚀 Summary of Proposed Changes:
+
+Part	Enhancement	Benefits
+1	Round Robin VM	Even load distribution among VMs
+2	Delta State	Prevent lost updates & fault-tolerant
+3	Notification via Delta	Reliable, queryable notifications
+Next Steps:
+
+Integrate the provided logic snippets.
+Validate each implementation step in your Databricks environment.
+Ensure Delta tables are properly configured and optimized.
+This comprehensive update enhances reliability, scalability, and maintainability of your existing infrastructure.
