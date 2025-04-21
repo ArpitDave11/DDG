@@ -3,122 +3,127 @@ import itertools
 import subprocess
 
 from azure.identity import DefaultAzureCredential
-from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 
 
-def get_vm_list(subscription_id):
+def get_backend_pool_ips(
+    subscription_id: str,
+    resource_group: str,
+    load_balancer_name: str,
+    pool_name: str = None
+):
     """
-    Return a list of all VM models in the subscription.
+    Returns a list of tuples: (vm_name, nic_name, ip_address)
+    for every IP config tied into the specified LB backend pool.
     """
-    compute_client = ComputeManagementClient(
-        credential=DefaultAzureCredential(),
-        subscription_id=subscription_id
-    )
-    return list(compute_client.virtual_machines.list_all())
-
-
-def extract_nic_ips(vm, subscription_id, network_client=None):
-    """
-    Given a VM model, fetch its NIC resources and pull out all IPs:
-      - public IPs (if any)
-      - private IPs
-    Returns a list of (ip_address:str, nic_name:str) tuples.
-    """
-    if network_client is None:
-        network_client = NetworkManagementClient(
-            credential=DefaultAzureCredential(),
-            subscription_id=subscription_id
-        )
-
-    # Parse the VM's resource group from its ARM ID
-    parts = vm.id.split('/')
-    rg = parts[parts.index('resourceGroups') + 1]
-
-    ips = []
-    for nic_ref in vm.network_profile.network_interfaces:
-        # nic_ref.id == /.../resourceGroups/<rg>/providers/Microsoft.Network/networkInterfaces/<nic_name>
-        nic_parts = nic_ref.id.split('/')
-        nic_rg   = nic_parts[nic_parts.index('resourceGroups') + 1]
-        nic_name = nic_parts[-1]
-
-        nic = network_client.network_interfaces.get(nic_rg, nic_name)
-
-        for ip_conf in nic.ip_configurations:
-            # 1) Public IP
-            if ip_conf.public_ip_address:
-                pip_parts = ip_conf.public_ip_address.id.split('/')
-                pip_rg   = pip_parts[pip_parts.index('resourceGroups') + 1]
-                pip_name = pip_parts[-1]
-                public_ip = network_client.public_ip_addresses.get(pip_rg, pip_name)
-                ips.append((public_ip.ip_address, nic_name))
-
-            # 2) Private IP
-            elif ip_conf.private_ip_address:
-                ips.append((ip_conf.private_ip_address, nic_name))
-
-    return ips
-
-
-def ping_ip(ip, count=4, timeout=5):
-    """
-    Ping a single IP; return True if 0% packet loss.
-    """
-    proc = subprocess.Popen(
-        ["ping", "-c", str(count), "-W", str(timeout), ip],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    out, _ = proc.communicate()
-    text = out.decode("utf-8", errors="ignore")
-    return "0% packet loss" in text
-
-
-def select_reachable_vm(subscription_id):
-    """
-    Round‐robin through all VMs → for each VM, try each extracted IP → return
-    the first (vm, ip, nic_name) that responds to ping.
-    """
-    vms = get_vm_list(subscription_id)
-    if not vms:
-        raise RuntimeError("No VMs found in subscription.")
-
     net_client = NetworkManagementClient(
         credential=DefaultAzureCredential(),
         subscription_id=subscription_id
     )
 
-    seen = set()
-    rr = itertools.cycle(vms)
-    for _ in range(len(vms)):
-        vm = next(rr)
-        if vm.id in seen:
+    # 1) Fetch the LB
+    lb = net_client.load_balancers.get(resource_group, load_balancer_name)
+
+    # 2) Pick the pool (by name or first one)
+    pools = lb.backend_address_pools or []
+    if not pools:
+        raise RuntimeError(f"Load Balancer {load_balancer_name} has no backend pools.")
+    if pool_name:
+        pool = next((p for p in pools if p.name == pool_name), None)
+        if pool is None:
+            raise RuntimeError(f"No pool named {pool_name} in LB {load_balancer_name}")
+    else:
+        pool = pools[0]
+
+    results = []
+    # 3) Each .backend_ip_configurations is a reference to a NIC's IP config
+    for ip_conf_ref in pool.backend_ip_configurations or []:
+        # parse: /subscriptions/.../resourceGroups/rg/providers/Microsoft.Network/
+        #          networkInterfaces/{nic_name}/ipConfigurations/{conf_name}
+        parts = ip_conf_ref.id.split("/")
+        rg_idx = parts.index("resourceGroups") + 1
+        nic_idx = parts.index("networkInterfaces") + 1
+        conf_idx = parts.index("ipConfigurations") + 1
+
+        nic_rg      = parts[rg_idx]
+        nic_name    = parts[nic_idx]
+        config_name = parts[conf_idx]
+
+        # 4) Retrieve the full NIC
+        nic = net_client.network_interfaces.get(nic_rg, nic_name)
+
+        # 5) Find that specific ipConfiguration on the NIC
+        ip_conf = next((c for c in nic.ip_configurations if c.name == config_name), None)
+        if not ip_conf:
             continue
-        seen.add(vm.id)
 
-        ips = extract_nic_ips(vm, subscription_id, network_client=net_client)
-        print(f"[INFO] VM {vm.name} has IPs: {ips}")
+        # 6a) Private IP
+        if ip_conf.private_ip_address:
+            results.append((nic.virtual_machine.id.split("/")[-1], nic_name, ip_conf.private_ip_address))
 
-        for ip, nic in ips:
-            print(f"[INFO] Pinging {vm.name}/{nic} @ {ip}...")
-            if ping_ip(ip):
-                print(f"[SUCCESS] {vm.name}/{nic} ({ip})")
-                return vm, ip, nic
+        # 6b) Public IP (if attached)
+        if ip_conf.public_ip_address:
+            pip_id   = ip_conf.public_ip_address.id
+            pip_parts= pip_id.split("/")
+            pip_rg   = pip_parts[pip_parts.index("resourceGroups")+1]
+            pip_name = pip_parts[-1]
+            public_ip = net_client.public_ip_addresses.get(pip_rg, pip_name)
+            if public_ip.ip_address:
+                results.append((nic.virtual_machine.id.split("/")[-1], nic_name, public_ip.ip_address))
 
-        print(f"[WARN] All IPs failed for VM {vm.name}")
+    return results
 
-    raise RuntimeError("No reachable VM found.")
+
+def ping_test(ip: str, count: int = 4, timeout: int = 5) -> bool:
+    """
+    Returns True if ping → “0% packet loss” in the output.
+    """
+    proc = subprocess.Popen(
+        ["ping", "-c", str(count), "-W", str(timeout), ip],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, _ = proc.communicate()
+    return b"0% packet loss" in out
+
+
+def select_reachable_from_lb(
+    subscription_id: str,
+    resource_group: str,
+    load_balancer_name: str,
+    pool_name: str = None
+):
+    """
+    Round‐robin through all backend pool IPs; 
+    returns the first (vm_name, nic_name, ip) that responds, or raises if none do.
+    """
+    entries = get_backend_pool_ips(
+        subscription_id, resource_group, load_balancer_name, pool_name
+    )
+    if not entries:
+        raise RuntimeError("No NIC‑IP entries found in that backend pool.")
+
+    # cycle through VM/NIC/IP tuples
+    for vm_name, nic_name, ip in itertools.cycle(entries):
+        print(f"[INFO] Trying {vm_name}/{nic_name} @ {ip}…")
+        if ping_test(ip):
+            print(f"[SUCCESS] {vm_name}/{nic_name} ({ip}) is reachable.")
+            return vm_name, nic_name, ip
+
+    # in practice you’ll never exit the for‐loop without a break unless entries empty
+    raise RuntimeError("No reachable IP found in backend pool.")
 
 
 def main():
-    # load from env or replace here
-    subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID") or "<YOUR-SUBSCRIPTION-ID>"
+    sub_id  = os.getenv("AZURE_SUBSCRIPTION_ID", "<YOUR-SUB-ID>")
+    rg      = os.getenv("AZURE_RESOURCE_GROUP", "<YOUR-RG>")
+    lb_name = os.getenv("AZURE_LOAD_BALANCER", "<YOUR-LB-NAME>")
+    pool    = os.getenv("AZURE_LB_POOL", None)  # optional
 
     try:
-        vm, ip, nic = select_reachable_vm(subscription_id)
-        print(f"\n🔎 Selected VM: {vm.name}\n    NIC: {nic}\n    IP : {ip}")
+        vm, nic, ip = select_reachable_from_lb(sub_id, rg, lb_name, pool)
+        print(f"\n→ Selected: VM={vm}, NIC={nic}, IP={ip}")
     except Exception as e:
-        print("\n❌", e)
+        print("❌", e)
 
 
 if __name__ == "__main__":
