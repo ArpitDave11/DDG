@@ -1,107 +1,56 @@
-#!/usr/bin/env python3
-import psycopg2
-import json
-import logging
+# Part 1: Round-Robin VM Selection
 
-def generate_database_metadata(conn):
+from datetime import datetime
+import subprocess
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+
+# Example list of VMs behind the load balancer (replace with actual hostnames or IPs)
+vm_list = ["vm1.mycompany.net", "vm2.mycompany.net", "vm3.mycompany.net"]
+
+# Initialize the Delta table for round-robin index if it doesn't exist.
+# The table will have a single row storing the last used index (starting at -1 so the first VM used will be index 0).
+if not spark.catalog.tableExists("default.vm_round_robin"):
+    (spark.createDataFrame([(-1,)], ["last_index"])
+         .write.format("delta").mode("overwrite").saveAsTable("default.vm_round_robin"))
+
+def is_vm_reachable(host: str) -> bool:
+    """Ping the given host once to check if it's reachable. Returns True if reachable, False if not."""
+    try:
+        # '-c 1' sends a single ping, '-W 3' sets a 3-second timeout for the ping reply
+        subprocess.check_output(["ping", "-c", "1", "-W", "3", host])
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+def select_next_reachable_vm(vm_list: list) -> str:
     """
-    Queries the PostgreSQL information_schema to generate nested metadata.
-    
-    Output format is a dictionary where:
-      - keys are schema names;
-      - values are dictionaries whose keys are table names;
-      - each table entry has a key "columns" which is a list of dictionaries
-        containing details about each column.
+    Selects the next VM in round-robin order from vm_list that is reachable.
+    Updates the Delta table with the chosen index and returns the VM host as a string.
+    Throws an exception if no VM is reachable.
     """
-    metadata = {}
-    cur = conn.cursor()
-
-    # Retrieve non-system schemas (filtering out pg_catalog and information_schema)
-    cur.execute("""
-        SELECT schema_name 
-        FROM information_schema.schemata
-        WHERE schema_name NOT IN ('pg_catalog', 'information_schema');
-    """)
-    schemas = cur.fetchall()
-    logging.info("Found %d user schemas.", len(schemas))
+    # Fetch the last used index from the Delta table
+    last_index = spark.table("default.vm_round_robin").select("last_index").head()[0]
+    if last_index is None:
+        last_index = -1
+    # Compute the next index in round-robin fashion
+    start_index = (last_index + 1) % len(vm_list)
     
-    for (schema,) in schemas:
-        metadata[schema] = {}
+    chosen_index = None
+    # Try each VM in the list (up to length of list attempts) to find a reachable one
+    for offset in range(len(vm_list)):
+        idx = (start_index + offset) % len(vm_list)
+        vm_host = vm_list[idx]
+        # Ping the VM to check reachability
+        if is_vm_reachable(vm_host):
+            chosen_index = idx
+            break
+    if chosen_index is None:
+        # No VM responded to ping
+        raise Exception("No reachable VM found in the list.")
+    
+    # Update the Delta table with the new last-used index (chosen_index)
+    vm_index_dt = DeltaTable.forName(spark, "default.vm_round_robin")
+    vm_index_dt.update(condition="true", set={"last_index": F.lit(chosen_index)})
+    return vm_list[chosen_index]
 
-        # Get all base tables for the current schema
-        cur.execute("""
-            SELECT table_name 
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_type = 'BASE TABLE';
-        """, (schema,))
-        tables = cur.fetchall()
-        logging.info("Schema '%s' contains %d tables.", schema, len(tables))
-        
-        for (table,) in tables:
-            metadata[schema][table] = {"columns": []}
-
-            # Query column details for each table
-            cur.execute("""
-                SELECT 
-                    column_name, 
-                    data_type, 
-                    is_nullable, 
-                    column_default 
-                FROM information_schema.columns
-                WHERE table_schema = %s AND table_name = %s;
-            """, (schema, table))
-            columns = cur.fetchall()
-            
-            for col in columns:
-                col_name, data_type, is_nullable, default = col
-                col_dict = {
-                    "column": col_name,
-                    "data_type": data_type,
-                    "is_nullable": is_nullable,
-                    "default": default if default is not None else ""
-                }
-                metadata[schema][table]["columns"].append(col_dict)
-                
-    cur.close()
-    return metadata
-
-
-def main():
-    # Assume your config module contains something like:
-    # config = {
-    #    "postgres": {
-    #         "connection_string": "postgresql://user:password@host:port/dbname"
-    #    }
-    # }
-    try:
-        from config import config
-        db_url = config['postgres']['connection_string']
-    except Exception as e:
-        logging.error("Error loading database configuration: %s", e)
-        return
-
-    # Connect to PostgreSQL
-    try:
-        conn = psycopg2.connect(db_url)
-        logging.info("Connected to PostgreSQL database.")
-    except Exception as e:
-        logging.error("Error connecting to PostgreSQL: %s", e)
-        return
-
-    # Generate metadata dictionary
-    metadata = generate_database_metadata(conn)
-    conn.close()
-
-    # Write JSON output to file
-    output_file = "database_metadata.json"
-    try:
-        with open(output_file, "w") as f:
-            json.dump(metadata, f, indent=4)
-        logging.info("Database metadata JSON file generated: %s", output_file)
-    except Exception as e:
-        logging.error("Error writing JSON to file: %s", e)
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    main()
