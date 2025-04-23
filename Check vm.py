@@ -1,298 +1,223 @@
-Thanks! I’ll put together a Databricks-based solution that:
-- Retrieves the list of VMs in the given Azure subscription and resource group.
-- Applies round-robin logic across only *reachable* VMs using ping tests.
-- Automatically skips unreachable ones.
-- Initiates a job (via SSH or API call) on the selected VM.
+Introduction
 
-I’ll include all setup steps, code, and configurations to ensure this works end-to-end inside Azure Databricks.
-I'll get back to you shortly with a complete, tested solution.
+This Databricks notebook orchestrates running a shell command on an Azure VM selected from an Azure Load Balancer's backend pool, and logs the job status to Delta. It extends the initial solution with the following enhancements:
+Delta Logging with Upsert: Job status is logged to Delta files (Delta Lake format) instead of a traditional table, partitioned by date, with upsert logic to avoid duplicate entries.
+Unity Catalog Integration: If the Delta tables do not exist, they are created in the Unity Catalog (e.g. under finance_catalog) at specified storage locations. This ensures the logs are queryable as managed tables.
+Logging Schema: The log entries include file_name, job_id, status, autosys_flag, data_as_update (today’s date partition), and timestamp (log entry time).
+Notifications Table: A separate Delta table (and underlying file storage) for notifications includes all the above fields plus a notification_flag to track notification status.
+Immediate Notification Log Upsert: After writing each status log entry, the same entry is upserted into the notifications Delta table with notification_flag = false (pending notification).
+Kafka Consumer Pseudocode: Outline of a Kafka consumer (or streaming job) that:
+Polls the notifications table for entries where autosys_flag = true and notification_flag = false.
+Sends out a notification for each such entry (e.g. via a Kafka producer or other notification mechanism).
 
-# Azure Databricks Guide: Round-Robin Selection of Azure VMs for Remote Job Execution
+Updates each processed entry’s notification_flag to true to mark it as notified.
+Scheduled Execution: This notebook is intended to be triggered by an Azure Data Factory (or Synapse) pipeline every 15 minutes, as well as once daily at 03:00. The daily 3:00 AM run corresponds to an "Autosys" job (signified by autosys_flag = true for special handling and notification), while the 15-minute runs are regular incremental checks (autosys_flag = false by default).
+With these features, the notebook can run in a Unity Catalog-enabled workspace and maintain comprehensive logs with notifications. Below, we proceed step-by-step through the implementation.
+1. Configuration and Parameter Setup
 
-## Overview
+First, we retrieve input parameters for the load balancer and the shell command to execute on the VM. We also define paths for Delta log storage and ensure the Unity Catalog is set to the correct catalog/schema. If needed, we determine the Autosys flag (true for the daily run at 3:00 AM, false otherwise). We also prepare or retrieve identifiers like job_id and file_name for logging purposes.
+# Databricks notebook widgets for input parameters (provided by ADF pipeline or manually set)
+dbutils.widgets.text("lb_id", "")            # Azure Load Balancer resource ID or name
+dbutils.widgets.text("shell_command", "")    # Shell command to run on the VM
+dbutils.widgets.text("job_id", "")           # Optional job identifier (if not provided, will generate)
 
-This guide describes how to build an Azure Databricks solution that selects an Azure Virtual Machine (VM) in round-robin fashion and triggers a job on it. The solution operates within a single Azure **subscription** and **resource group** (specified by the user) and assumes you have full access to Azure and Databricks. The main tasks the solution performs are:
+# Retrieve parameter values
+lb_id = dbutils.widgets.get("lb_id")
+shell_command = dbutils.widgets.get("shell_command")
+job_id = dbutils.widgets.get("job_id")
 
-1. **List all VMs** in a given Azure resource group.  
-2. **Ping each VM** to check if it’s running and network-accessible (reachability).  
-3. **Skip unreachable** VMs and maintain a **round-robin rotation** among the reachable ones.  
-4. **Persist the last used VM index** so that each run picks the next VM in sequence.  
-5. **Execute a remote job** on the selected VM (e.g. via SSH, REST API call, or Azure VM run-command).
+# Generate a job_id if not provided
+import uuid, datetime
+if not job_id:
+    job_id = str(uuid.uuid4())  # Use a UUID or timestamp-based ID for the job run
 
-We will use **Python** with the Azure SDK inside an Azure Databricks notebook. Key libraries include Azure SDK packages like `azure-identity` for authentication and `azure-mgmt-compute` and `azure-mgmt-network` for resource management. The guide also covers setting up authentication (using a service principal or managed identity) and any necessary configuration (libraries, network permissions, etc.) for the Databricks environment.
+# Derive a file_name for logging (e.g., from the shell command or known context)
+# Here we take the last part of the command if it looks like a file path, otherwise use the command itself.
+if "/" in shell_command:
+    file_name = shell_command.rsplit("/", 1)[-1].split()[0]
+else:
+    file_name = shell_command.split()[0]
+    
+# Determine autosys_flag: mark True for the daily scheduled run (around 3 AM), else False for regular runs.
+current_hour = datetime.datetime.now().hour
+autosys_flag = True if current_hour == 3 else False
 
-## Prerequisites and Setup
+print(f"Parameters - LB: {lb_id}, Command: '{shell_command}', Job ID: {job_id}, File: {file_name}, Autosys flag: {autosys_flag}")
+Explanation: We use Databricks widgets to supply the Load Balancer ID and shell command (these would be set by the ADF pipeline triggers). We also include an optional job_id widget for an external job identifier (if the scheduler provides one; otherwise we generate a UUID for uniqueness). The file_name is inferred from the shell command (this could represent the script or process being run). The autosys_flag is set to True for the special daily run (here simplistically determined by hour == 3; in practice, the pipeline could pass a parameter or use a separate pipeline for the daily job). These values will be used in logging.
+2. Identify Active VM from Load Balancer Backend
 
-Before implementing the solution, ensure the following prerequisites are met:
+Next, we connect to Azure to retrieve the list of backend VM IPs from the given Azure Load Balancer, then ping each to find the first responsive VM. This uses Azure SDK or REST API calls (with appropriate authentication set up) and network checks:
+# 1. Retrieve backend pool IP addresses of the given Azure Load Balancer
+# (Assuming a helper function or Azure SDK call is available for this)
+lb_backend_ips = get_load_balancer_backend_ips(lb_id)
+print(f"Found {len(lb_backend_ips)} backend IPs in load balancer '{lb_id}': {lb_backend_ips}")
 
-- **Azure Resources**: An Azure subscription with a resource group containing the target VMs. Note the **Subscription ID** and **Resource Group name**. All VMs should be in this resource group (they can be Windows or Linux). For network reachability, either the Databricks cluster should reside in the same Virtual Network as the VMs or the VMs should have public IP addresses with appropriate NSG rules allowing ping/SSH access.
-- **Databricks Workspace**: An Azure Databricks workspace with a cluster to run the notebook. The cluster should be running a runtime that supports Python 3 and has access to the Azure SDK (we will install needed libraries in the notebook).
-- **Azure Credentials**: A way for Databricks to authenticate to Azure. Typically, this is done via an Azure **Service Principal** (client ID, tenant ID, client secret) with proper RBAC rights. At minimum, it needs **Reader** access to list VMs in the resource group and perhaps **Contributor** if we use run-command on VMs. *(Alternatively, you can use a managed identity attached to the Databricks workspace for authentication.)*
+# 2. Ping each IP to find the first responsive VM
+active_ip = None
+for ip in lb_backend_ips:
+    if is_ping_successful(ip):  # is_ping_successful is a utility that pings the IP and returns True if reachable
+        active_ip = ip
+        break
 
-**Library Installation:** In your Databricks notebook, install the required Azure SDK packages. You can use the `%pip` magic command at the top of the notebook to install libraries into the cluster environment:
+if not active_ip:
+    raise Exception(f"No backend VM responded to ping for Load Balancer {lb_id}")
+print(f"Active VM IP found: {active_ip}")
+Explanation: We assume get_load_balancer_backend_ips retrieves all VM IP addresses in the load balancer's backend pool (using Azure APIs). We then iterate through these IPs, using a helper is_ping_successful to test connectivity (for example, by sending an ICMP ping or similar). The loop breaks at the first responsive IP, which we consider the active VM to target. If none respond, the notebook raises an exception since no VM is available.
+3. Execute Shell Command on the Identified VM
 
-```python
-# Install required Azure SDK packages on the Databricks cluster (run this in a notebook cell).
-%pip install azure-identity azure-mgmt-compute azure-mgmt-network
-```
+Once we have the active VM's IP, we need its Azure resource information (like NIC or VM ID) to run the command. We find the VM's network interface and resource ID, then use Azure's Run Command feature to execute the given shell command on that VM:
+# 3. Map the IP to the VM's network interface and resource ID
+vm_nic, vm_id = get_vm_nic_and_id_by_ip(active_ip)
+print(f"Resolved VM NIC: {vm_nic}, VM Resource ID: {vm_id} for IP: {active_ip}")
 
-This will install:
-- `azure-identity`: for Azure AD authentication in Python.
-- `azure-mgmt-compute`: to interact with Azure Compute resources (VMs).
-- `azure-mgmt-network`: to interact with networking resources (to get IP addresses of VMs).
+# 4. Execute the provided shell command on the VM via Azure RunCommand
+try:
+    run_command_response = execute_vm_run_command(vm_id, shell_command)
+    command_status = "Success"
+    print("RunCommand executed successfully.")
+except Exception as e:
+    run_command_response = str(e)
+    command_status = "Failed"
+    print(f"RunCommand failed: {e}")
+Explanation: Using the active IP, we call a helper (or Azure SDK) get_vm_nic_and_id_by_ip to retrieve the VM's NIC name and the VM resource ID. This typically involves querying Azure for the NIC resource associated with that IP, then the VM attached to that NIC. With the VM's resource ID, we use Azure Compute's Run Command API to execute the shell_command on the VM (execute_vm_run_command encapsulates this Azure API call). We wrap this in a try/except to capture success or failure. On success, command_status is "Success"; if an exception occurs, we capture it and mark command_status as "Failed". The run_command_response could contain the output or error message from the execution, which we print or could log if needed. At this point, the shell command has been run on the chosen VM, and we have a status for the job.
+4. Delta Lake Paths and Table Initialization (Unity Catalog)
 
-## Azure Authentication in Databricks
+Before logging, we set up the Delta Lake storage locations and ensure the corresponding Delta tables exist in Unity Catalog. We will log data to these paths in Delta format. If the tables are not already created, we create them (unmanaged Delta tables with specified schema, partitioned by date). Partitioning by data_as_update (the date) is used to organize log data by run date, which is a recommended practice for log data to optimize queries and upsert ranges​
+docs.databricks.com
+.
+# Define Delta file storage paths for logs and notifications (these should be configured to an accessible location, e.g., ADLS mount)
+process_logs_path = "<path_to_process_logs_delta_files>"         # e.g., "dbfs:/mnt/logs/process_logs"
+notifications_path = "<path_to_notifications_delta_files>"       # e.g., "dbfs:/mnt/logs/notifications"
 
-For the Databricks notebook to access Azure resources, authenticate using Azure AD credentials. The simplest method is to use a **Service Principal**. You can provide its details via environment variables so that the Azure SDK picks them up. The Azure SDK’s `DefaultAzureCredential` will automatically use these environment variables (or a managed identity, if configured) to obtain a token ([Getting started - Managing Compute using Azure Python SDK - Code Samples | Microsoft Learn](https://learn.microsoft.com/en-us/samples/azure-samples/azure-samples-python-management/compute/#:~:text=2,based%20OS%2C%20you%20can%20do)). 
+# Ensure the Unity Catalog is set (if using Unity Catalog)
+# For example, use the finance_catalog and schema (if applicable)
+# spark.sql("USE CATALOG finance_catalog")
+# spark.sql("USE SCHEMA <your_schema>")  # use appropriate schema if needed
 
-**Setup Azure credentials** (replace the placeholder values with your actual Tenant ID, Client ID, Client Secret, and Subscription ID): 
+# Create Delta tables in Unity Catalog if they do not exist
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS finance_catalog.process_logs (
+    file_name STRING,
+    job_id STRING,
+    status STRING,
+    autosys_flag BOOLEAN,
+    data_as_update DATE,
+    timestamp TIMESTAMP
+)
+USING DELTA
+PARTITIONED BY (data_as_update)
+LOCATION '{process_logs_path}'
+""")
 
-```python
-import os
-# Set environment variables for Azure credentials (Service Principal)
-os.environ["AZURE_TENANT_ID"] = "<YOUR_TENANT_ID>"
-os.environ["AZURE_CLIENT_ID"] = "<YOUR_SP_CLIENT_ID>"
-os.environ["AZURE_CLIENT_SECRET"] = "<YOUR_SP_CLIENT_SECRET>"
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS finance_catalog.process_notifications (
+    file_name STRING,
+    job_id STRING,
+    status STRING,
+    autosys_flag BOOLEAN,
+    data_as_update DATE,
+    timestamp TIMESTAMP,
+    notification_flag BOOLEAN
+)
+USING DELTA
+PARTITIONED BY (data_as_update)
+LOCATION '{notifications_path}'
+""")
+Explanation: We specify the storage paths for the Delta files (the user should replace <path_to_...> with actual paths configured in their environment, such as an ADLS Gen2 location or DBFS mount). We then use Spark SQL DDL to create the tables if not exists. These tables are external (unmanaged) Delta tables, as we explicitly provide the LOCATION. They are partitioned by the data_as_update column (date), aligning with our data. The schema is defined to include all required fields, and for the notifications table we add the notification_flag. By doing CREATE TABLE IF NOT EXISTS, if the table is already created in the Unity Catalog, the command will not overwrite it (and if the Delta files already exist with data, the table will register that data). If the table doesn't exist, this will create a new entry in Unity Catalog pointing to the Delta files location (inheriting our specified schema).
+Note: Using Unity Catalog means the table name finance_catalog.process_logs is a fully qualified identifier (CatalogName.SchemaName.TableName). In this example, finance_catalog might represent the catalog (and possibly a default schema). Ensure to include the proper schema name if required (e.g., finance_catalog.logging.process_logs if "logging" is the schema). The above assumes a default schema or a schema name implicitly included. Adjust the naming to your UC setup. The storage locations must be within a Unity Catalog volume or an allowed external location.
+5. Log Job Status to Delta (Process Logs Table)
 
-# Azure subscription and resource group info
-subscription_id = "<YOUR_AZURE_SUBSCRIPTION_ID>"
-resource_group = "<YOUR_RESOURCE_GROUP_NAME>"
-```
-
-> *💡 **Security Note:** In practice, do not hard-code secrets in code. Use Databricks [Secret Scopes](https://docs.microsoft.com/azure/databricks/security/secrets) to securely store the client secret and retrieve it (e.g., via `dbutils.secrets.get`). The code above uses environment variables for simplicity. Ensure the service principal has at least read access to the resource group (and VM run command privileges if needed).*
-
-Next, create Azure SDK clients using these credentials. We use `DefaultAzureCredential` for authentication and then initialize the Compute and Network management clients with the subscription ID:
-
-```python
-from azure.identity import DefaultAzureCredential
-from azure.mgmt.compute import ComputeManagementClient
-from azure.mgmt.network import NetworkManagementClient
-
-# Acquire a credential object for Azure (this will use the env vars set above)
-credential = DefaultAzureCredential()
-
-# Initialize Azure management clients for Compute and Network
-compute_client = ComputeManagementClient(credential, subscription_id)
-network_client = NetworkManagementClient(credential, subscription_id)
-```
-
-The above code establishes connections to Azure. The `ComputeManagementClient` will allow us to list VMs and manage them, and the `NetworkManagementClient` will help retrieve network interface details (for IP addresses). This pattern of creating clients with credentials and subscription is standard in Azure SD ([Get IP from VM object using azure sdk in python - Stack Overflow](https://stackoverflow.com/questions/40728871/get-ip-from-vm-object-using-azure-sdk-in-python#:~:text=compute_client%20%3D%20ComputeManagementClient,subscription_id))】.
-
-## Listing VMs in the Resource Group
-
-With the compute client ready, we can list all virtual machines in the target resource group. Azure SDK provides a method `compute_client.virtual_machines.list(resource_group_name)` to get VMs. We’ll retrieve the VMs and then filter for those that are running and reachable:
-
-```python
-# Fetch all VMs in the specified resource group
-vm_list = list(compute_client.virtual_machines.list(resource_group))
-print(f"Found {len(vm_list)} VMs in resource group '{resource_group}'.")
-```
-
-Each item in `vm_list` is a VirtualMachine resource object. We can examine properties like `vm.name` for the VM’s name and `vm.network_profile` for its network interfaces, etc. 
-
-Before attempting to ping a VM, it’s wise to check if the VM is powered on (running). We can use the Azure SDK to get the **instance view** (status) of each VM. The instance view provides status codes, including power state. For example, a status code of `"PowerState/running"` indicates the VM is runnin ([How could I list Azure Virtual Machines using Python? - Stack Overflow](https://stackoverflow.com/questions/58925397/how-could-i-list-azure-virtual-machines-using-python#:~:text=statuses%20%3D%20compute_client,2%20and%20statuses%5B1))】. We will call `compute_client.virtual_machines.instance_view()` for each VM to get its status:
-
-```python
-reachable_vms = []  # will store tuples of (vm_name, ip_address) for reachable VMs
-
-for vm in vm_list:
-    vm_name = vm.name
-    # Get instance view to check power state
-    instance_view = compute_client.virtual_machines.instance_view(resource_group, vm_name)
-    statuses = instance_view.statuses
-
-    # Determine if VM is running
-    power_state = None
-    for stat in statuses:
-        if stat.code and stat.code.startswith('PowerState'):
-            power_state = stat.code  # e.g., "PowerState/running" or "PowerState/deallocated"
-    if power_state != 'PowerState/running':
-        print(f"VM '{vm_name}' is not running (status: {power_state}), skipping.")
-        continue  # skip stopped or deallocated VMs
-```
-
-In the loop above, we skip VMs that are not in a running state. The check uses the status codes returned by `instance_view` (note: typically `statuses[1]` is the power stat ([How could I list Azure Virtual Machines using Python? - Stack Overflow](https://stackoverflow.com/questions/58925397/how-could-i-list-azure-virtual-machines-using-python#:~:text=statuses%20%3D%20compute_client,2%20and%20statuses%5B1))】, but we loop for clarity). Now, for each running VM, we will retrieve its IP address and attempt a ping.
-
-## Retrieving VM IP and Checking Reachability
-
-To ping a VM, we need an IP address (private or public) that the Databricks cluster can reach. Azure VMs have one or more network interfaces (NICs). Each NIC can have a private IP and optionally a public IP. We will use the Azure **NetworkManagementClient** to get NIC details, then extract the IP. 
-
-For simplicity, we’ll assume each VM has at least one NIC and use the first NIC. We retrieve the NIC’s resource ID from `vm.network_profile.network_interfaces[0].id`, then use the network client to get that NIC resource. From the NIC, we can get the IP configurations which include the private IP and possibly a reference to a public I ([Get IP from VM object using azure sdk in python - Stack Overflow](https://stackoverflow.com/questions/40728871/get-ip-from-vm-object-using-azure-sdk-in-python#:~:text=try%3A%20thing%3Dnetwork_client)) ([Get IP from VM object using azure sdk in python - Stack Overflow](https://stackoverflow.com/questions/40728871/get-ip-from-vm-object-using-azure-sdk-in-python#:~:text=In%20this%20example%20you%20could,to%20get%20the%20public%20IPs))】:
-
-```python
-    # VM is running, get its primary NIC and IP
-    nic_id = vm.network_profile.network_interfaces[0].id  # NIC resource ID
-    # Parse NIC name and resource group from the ID (format: .../resourceGroups/<RG>/.../networkInterfaces/<NICName>)
-    nic_name = nic_id.split("/")[-1]
-    nic_rg = nic_id.split("/")[4]  # NIC's resource group (often same as VM RG)
-
-    # Get NIC details
-    nic = network_client.network_interfaces.get(nic_rg, nic_name)
-    ip_address = None
-    if nic.ip_configurations and len(nic.ip_configurations) > 0:
-        # Take the first IP configuration
-        ip_config = nic.ip_configurations[0]
-        # Prefer private IP if available
-        if ip_config.private_ip_address:
-            ip_address = ip_config.private_ip_address
-        # If no private IP (or not reachable), use public IP if exists
-        if not ip_address and ip_config.public_ip_address:
-            pub_ip_id = ip_config.public_ip_address.id
-            pub_name = pub_ip_id.split("/")[-1]
-            pub_rg = pub_ip_id.split("/")[4]
-            public_ip = network_client.public_ip_addresses.get(pub_rg, pub_name)
-            ip_address = public_ip.ip_address
-```
-
-At this point, the variable `ip_address` holds an address to contact the VM. If the Databricks cluster is on the same virtual network as the VM, the private IP will be used. If the cluster is external, we fall back to the public IP (if the VM has one and the NSG/firewall permits access).
-
-Now we attempt to **ping** the IP to check reachability. We can use Python’s `subprocess` to call the system ping utility. On Linux Databricks clusters, the ping command will use the `-c 1` flag to send a single ICMP packet (on Windows, the flag would be `-n 1`). We’ll construct the ping command accordingly and check the exit code:
-
-```python
-        # Test reachability with a ping
-        import platform, subprocess
-        if ip_address:
-            # Use appropriate ping syntax for the platform
-            ping_count_flag = "-n" if platform.system().lower() == "windows" else "-c"
-            ping_cmd = ["ping", ping_count_flag, "1", ip_address]
-            try:
-                result = subprocess.run(ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
-                if result.returncode == 0:
-                    reachable_vms.append((vm_name, ip_address))
-                    print(f"VM '{vm_name}' is reachable at {ip_address}.")
-                else:
-                    print(f"VM '{vm_name}' did not respond to ping.")
-            except Exception as e:
-                print(f"Ping to VM '{vm_name}' failed: {e}")
-        else:
-            print(f"No IP address found for VM '{vm_name}', skipping.")
-```
-
-This code attempts one ping to the VM’s IP. If the ping succeeds (exit code 0), we consider the VM **reachable** and add it to our `reachable_vms` list. If it fails or times out, we skip that VM. The `reachable_vms` list will accumulate all VMs that are **running and network-accessible**.
-
-> *Note:* ICMP ping must be allowed by the VM’s network security group and the cluster’s network. If ICMP is blocked but the VM is actually reachable for the purpose of your job (for example, via TCP on a certain port), you might replace the ping test with an appropriate port check or alternate verification method. The concept remains to *skip* VMs that are not reachable.
-
-After this loop, we have a list of candidate VMs (`reachable_vms`). Each element is a tuple `(name, ip_address)`. Now we can implement the **round-robin selection** among these.
-
-## Handling No Reachable VMs (Retry Logic)
-
-It’s possible that no VM is reachable (for example, all are stopped or network-inaccessible at the moment). In such cases, the solution should retry or handle the absence of available VMs.
-
-If `reachable_vms` is empty after the initial scan, we can implement a simple **retry mechanism**: wait for a short interval and attempt the scan again, up to a certain number of retries. This gives time for a VM to start up or become reachable. For example:
-
-```python
-import time
-
-if not reachable_vms:
-    max_retries = 3
-    retry_delay_sec = 30
-    for attempt in range(1, max_retries+1):
-        print(f"No reachable VMs found. Retrying in {retry_delay_sec} seconds... (attempt {attempt}/{max_retries})")
-        time.sleep(retry_delay_sec)
-        # Re-run the scanning logic to update reachable_vms
-        reachable_vms = []
-        for vm in compute_client.virtual_machines.list(resource_group):
-            # (Repeat the VM status check and ping logic here to populate reachable_vms)
-            # ...
-            pass
-        if reachable_vms:
-            print("A VM became reachable after retry.")
-            break
-
-    if not reachable_vms:
-        raise RuntimeError("No reachable VM available after multiple retries.")
-```
-
-In the code above, we pause and retry the VM discovery and ping up to 3 times (with a 30-second interval). If after retries no VM is reachable, we raise an exception or take alternate action (you might choose to alert or exit gracefully instead of raising an error, depending on your use case).
-
-## Round-Robin VM Selection (Persisting State)
-
-Once we have a list of reachable VMs, we need to select the “next” VM in a round-robin fashion. This requires remembering which VM was used last time. We’ll maintain a persistent index that points to the last used VM, and increment it each time. On each run, the next VM in the list will be chosen.
-
-**Persistent tracking:** We can store the last used index in a small **Delta Lake** table or a file in DBFS. Using Delta is convenient in Databricks for small metadata, as it allows easy reads/writes and can handle concurrency if needed. We'll illustrate using a Delta table. (Alternatively, a simple file can be used with `dbutils.fs.put ([Databricks File Save - Stack Overflow](https://stackoverflow.com/questions/56442678/databricks-file-save#:~:text=To%20save%20a%20file%20to,the%20%2FFileStore%20directory%20in%20DBFS))】 to write the index, and read it back on the next run.)
-
-First, define where to store the state (for example, a path in DBFS):
-
-```python
+Now we create a DataFrame for the current job's status and write it to the Delta logs. We use an upsert (merge) operation to insert the new log entry, or update an existing entry if one with the same job_id already exists. This upsert behavior is crucial for idempotency – if the same job is run again or the log is retried, we won't duplicate entries but update the existing record.
+from pyspark.sql.functions import lit, current_date, current_timestamp
 from delta.tables import DeltaTable
 
-state_path = "dbfs:/FileStore/vm_round_robin_state"  # path for Delta table storage
+# Prepare the log entry as a Spark DataFrame
+log_df = spark.createDataFrame([
+    (file_name, job_id, command_status, autosys_flag)
+], schema=["file_name", "job_id", "status", "autosys_flag"]
+).withColumn("data_as_update", current_date()
+).withColumn("timestamp", current_timestamp())
 
-# If state table doesn't exist, initialize it with last_index = -1 (meaning no VM used yet)
-if not DeltaTable.isDeltaTable(spark, state_path):
-    spark.createDataFrame([(-1,)], ["last_index"]).write.format("delta").mode("overwrite").save(state_path)
+# Upsert (MERGE) the log entry into the process_logs Delta table
+# Identify matching record by job_id (assuming job_id is a unique identifier for the job run)
+delta_process_logs = DeltaTable.forPath(spark, process_logs_path)
+delta_process_logs.alias("t").merge(
+    log_df.alias("s"),
+    "t.job_id = s.job_id"
+).whenMatchedUpdateAll() \
+ .whenNotMatchedInsertAll() \
+ .execute()
+print("Upserted job status into process_logs Delta table.")
+Explanation: We construct a single-row DataFrame log_df with the job information: file_name, job_id, status (success or failed), autosys_flag, and we add the current date and timestamp. The schema matches our Delta table. We then obtain a DeltaTable object for the process logs (using the path to the Delta files). Using Delta Lake's merge operation, we merge this new DataFrame into the Delta table on the key job_id. The whenMatchedUpdateAll() and whenNotMatchedInsertAll() clauses ensure that if an entry with the same job_id already exists, it will be updated with the latest values; if it does not exist, it will be inserted​
+learn.microsoft.com
+. This pattern effectively implements an UPSERT (update or insert) in one operation. Delta Lake handles this in an atomic, ACID transaction. The partitioning by date (data_as_update) is handled automatically since the DataFrame contains that column; new partitions will be created as needed (for each date). Partitioning helps optimize merges by allowing us to scope operations to the relevant date range when needed​
+docs.databricks.com
+.
+6. Log to Notifications Table and Upsert Notification Entry
 
-# Read the last used index from the Delta table
-last_index_df = spark.read.format("delta").load(state_path)
-last_index = last_index_df.collect()[0]["last_index"]
-```
+After logging to the main process log, we also insert/update the entry in the notifications Delta table. The notifications table has an extra notification_flag field. We will write the same log entry with notification_flag = false (meaning not yet notified). Like before, we use an upsert merge on job_id. This duplication into a separate table allows a decoupled process to monitor pending notifications without interfering with the main log (and could have different retention or security settings if needed).
+# Prepare notification log entry by adding notification_flag = false
+notification_df = log_df.withColumn("notification_flag", lit(False))
 
-The above code uses `DeltaTable.isDeltaTable` to check if we have previously stored state. If not, it creates a Delta table (at the given path) with a single row, `last_index = -1`. Then it reads the table to get the last used index value. On first run, this will be -1.
+# Upsert the entry into the process_notifications Delta table
+delta_notifications = DeltaTable.forPath(spark, notifications_path)
+delta_notifications.alias("t").merge(
+    notification_df.alias("s"),
+    "t.job_id = s.job_id"
+).whenMatchedUpdateAll() \
+ .whenNotMatchedInsertAll() \
+ .execute()
+print("Upserted job status into notifications Delta table (notification_flag=false).")
+Explanation: We take the log_df DataFrame and add a column notification_flag set to False. This DataFrame notification_df has schema matching the notifications table. We then perform a similar merge/upsert into the process_notifications Delta table on job_id. If the job entry already exists in notifications (perhaps from a previous run attempt), it will be updated; otherwise, inserted anew. At this point, the process_notifications table has an entry for this job with autosys_flag (possibly true for the daily job) and notification_flag = false. This flags it as a pending notification for our Kafka/consumer process to pick up. By logging to the notifications table immediately, we ensure no delay between job completion and the notification queue. Each run of this notebook will append (or update) exactly one row in both the main log and the notifications log.
+7. Kafka Notification Consumer (Pseudocode)
 
-Now determine the next index in round-robin order. If `last_index` is -1 or reaches the end of the list, we wrap around to 0. Essentially, we do `(last_index + 1) mod N` where N is the number of reachable VMs:
+Finally, we outline a separate process (outside this notebook) that will handle sending notifications for completed Autosys jobs. In practice, this could be a continuously running Spark Structured Streaming job, a Kafka Connect job, or an external microservice. Here is pseudocode for a Kafka-based consumer that processes the notifications:
+# PSEUDOCODE: Notification Consumer Logic (to be implemented as a separate service or job)
+# This consumer checks the notifications Delta table for any entries that need notifications sent.
 
-```python
-# Determine next VM index in round-robin
-if not reachable_vms:
-    raise RuntimeError("No available VM to select.")  # (should not happen here if handled above)
-num_vms = len(reachable_vms)
-next_index = (last_index + 1) % num_vms  # round-robin calculation
+# Initialize Kafka producer or notification system (not fully implemented here)
+# e.g., producer = KafkaProducer(bootstrap_servers=[...]) or an email/SMS API client
 
-# Select the VM at next_index
-selected_vm_name, selected_vm_ip = reachable_vms[next_index]
-print(f"Selected VM for this run: {selected_vm_name} (IP: {selected_vm_ip})")
+while True:
+    # 1. Read pending notifications from Delta (those with autosys_flag = true and notification_flag = false)
+    pending_df = spark.read.format("delta").load(notifications_path) \
+        .filter("autosys_flag = true AND notification_flag = false")
+    pending_notifications = pending_df.collect()  # collect to driver (for small numbers of notifications)
 
-# Update the Delta state with the new last_index
-spark.createDataFrame([(next_index,)], ["last_index"]).write.format("delta").mode("overwrite").save(state_path)
-```
+    # 2. Send notifications for each pending entry
+    for row in pending_notifications:
+        # Construct notification message (could be an email, Kafka message, etc.)
+        message = f"Job {row.job_id} ({row.file_name}) completed with status {row.status} at {row.timestamp}."
+        if row.status != "Success":
+            message += " (Attention: Job did not succeed.)"
 
-At this point, `selected_vm_name` (and its IP) is the VM chosen to run the job, and the state is updated so that next time a different VM will be picked. The Delta table ensures the index persists across job runs. 
+        # Send the notification (for example, send to a Kafka topic or call an alerting service)
+        # producer.send("autosys_job_notifications", value=message.encode('utf-8'))
+        send_notification(message)  # placeholder for actual send logic
 
-*Alternative:* Instead of a Delta table, you could use a DBFS file as a simple counter store. For example, writing the index to `/FileStore/last_vm_index.txt` and reading it next time. Using `dbutils.fs.put("/FileStore/last_vm_index.txt", "2", overwrite=True)` would store the index as tex ([Databricks File Save - Stack Overflow](https://stackoverflow.com/questions/56442678/databricks-file-save#:~:text=To%20save%20a%20file%20to,the%20%2FFileStore%20directory%20in%20DBFS))】. Ensure proper locking if multiple processes might update it.
+        # 3. Mark this notification as sent by updating notification_flag to true
+        DeltaTable.forPath(spark, notifications_path).alias("t") \
+            .merge(
+                spark.createDataFrame([row.asDict()]).withColumn("notification_flag", lit(True)).alias("s"),
+                "t.job_id = s.job_id"
+            ) \
+            .whenMatchedUpdate(set = {"notification_flag": "true"}) \
+            .execute()
+        print(f"Notification sent for job {row.job_id}, marked as notified.")
+    
+    # 4. Sleep or wait for the next poll interval
+    time.sleep(60)  # wait 1 minute before checking again (or use structured streaming for real-time)
+Explanation: The above pseudocode represents how a notification service might work:
+It queries the process_notifications Delta table for any rows where autosys_flag is true (meaning it’s a job that requires notification) and notification_flag is false (meaning not yet notified). These are "pending" notifications.
+For each pending record, it composes a notification message. This could be an email, a message to a Kafka topic, a Slack alert, etc. In a Kafka scenario, one might use a Kafka producer to send the message to a notifications topic. In other contexts, this could directly call an API or send an email.
+After sending the notification successfully, it updates that record’s notification_flag to true in the Delta table. Here we show a Delta merge that finds the same job_id and updates the flag to true. This prevents sending duplicate notifications on the next poll.
+The loop then waits for a short interval and repeats. In a real implementation, this could be a continuous streaming job instead of a manual loop and sleep – for example, using Spark Structured Streaming on the Delta table or a Kafka consumer that is triggered by new messages (if we integrate Delta with Kafka Connect).
+Note: The actual implementation of the consumer depends on the infrastructure:
+If using Spark Structured Streaming, one could set up a streaming query on the Delta table that triggers a function (foreachBatch or foreach) for new entries.
+If using Kafka, another approach is to produce to a Kafka topic at the time of logging (instead of or in addition to writing to Delta), then have a standalone Kafka consumer service handle it. In that case, the Delta notifications table could be updated after producing to Kafka. The pseudocode above consolidates the logic in one place for clarity.
+The pseudocode uses spark.read in a loop for simplicity. A production solution should be careful with performance (possibly caching the table or using structured streaming) and with exactly-once semantics of notifications.
+Conclusion
 
-## Initiating a Job on the Selected VM
-
-After selecting the VM, the final step is to initiate the desired **job/task** on that VM. There are multiple ways to execute a job on a remote VM:
-
-- **SSH Command**: If the VM allows SSH access (e.g., a Linux VM with port 22 open), you could use an SSH client (such as Python’s `paramiko`) to connect and run a shell command or script on the VM. This requires network connectivity to the VM and credentials (SSH key or password).
-- **REST API Call**: If the VM is running a service that exposes a REST API, you could send an HTTP request (e.g., using `requests` in Python) to trigger an action on the VM. This requires the VM to have an accessible endpoint.
-- **Azure VM Run Command**: Azure provides a **Run Command** feature that lets you execute scripts on a VM through the Azure management plane. This doesn’t require direct network access to the VM; instead, Azure sends the command to the VM’s guest agent. We can invoke this via the Azure SDK.
-
-For a robust Databricks solution, using **Azure’s Run Command** is convenient since it works even if the cluster cannot directly reach the VM over the network (as long as the VM is running and has the Azure VM agent). Below, we use `ComputeManagementClient.virtual_machines.begin_run_command` to execute a script on the VM. We’ll demonstrate with a simple shell command. If the VM is Windows, we would use a PowerShell command instead.
-
-```python
-# Prepare the run-command payload
-if vm.network_profile:  # we'll assume we know the OS; here we use a Linux example
-    command_id = "RunShellScript"   # use "RunPowerShellScript" for Windows VM ([Run command in linux vm in azure using python sdk - Stack Overflow](https://stackoverflow.com/questions/51478227/run-command-in-linux-vm-in-azure-using-python-sdk/51485744#51485744#:~:text=If%20using%20Windows%2C%20you%20can,command%20id))】
-    script_lines = [
-        "echo Hello from Azure Databricks > /tmp/hello.txt"  # sample command: create a file on the VM
-    ]
-    command_params = {
-        "command_id": command_id,
-        "script": script_lines
-    }
-
-    # Invoke the run command on the VM
-    poller = compute_client.virtual_machines.begin_run_command(resource_group, selected_vm_name, command_params)
-    result = poller.result()  # wait for completion
-
-    # Check the result
-    if result.value and len(result.value) > 0:
-        output_message = result.value[0].message  # stdout/stderr from the VM script
-        print(f"Run Command output from {selected_vm_name}:\n{output_message}")
-    else:
-        print(f"Run Command completed on {selected_vm_name}, no output was returned.")
-```
-
-In the code above, we set `command_id` to `"RunShellScript"` for a Linux VM (the script provided is a bash command). For Windows VMs, Azure expects a PowerShell script and you would use `"RunPowerShellScript" ([Run command in linux vm in azure using python sdk - Stack Overflow](https://stackoverflow.com/questions/51478227/run-command-in-linux-vm-in-azure-using-python-sdk/51485744#51485744#:~:text=If%20using%20Windows%2C%20you%20can,command%20id))】 as the command_id and supply PowerShell commands. The `script` is a list of strings, each string is a line to execute on the VM. We then call `begin_run_command()` with the resource group, VM name, and parameters. This returns a poller (an asynchronous operation handle), and we call `.result()` to block until the command finishes. The result (of type `RunCommandResult`) may contain output in `result.value[0].message` (for example, any stdout or error message ([Python Azure SDK virtual_machines.run_command - Stack Overflow](https://stackoverflow.com/questions/62961460/python-azure-sdk-virtual-machines-run-command#:~:text=This%20is%20expected%20type%20as,python))】.
-
-**Verification:** The sample command writes a file `/tmp/hello.txt` on the VM. We printed the output message (if any) for confirmation. In practice, you would replace `script_lines` with whatever actions are needed to start your job on the VM (for example, launching a service, running a script, etc.). You could also pass parameters to the script if needed (Azure run-command allows parameters in the payload).
-
-## Additional Notes and Configuration
-
-- **Network and Permissions**: If you choose to use SSH or REST calls instead of Azure run-command, ensure the Databricks cluster can network-reach the VM (consider VNet peering or opening necessary firewall ports). Also ensure any credentials (SSH keys, etc.) are securely managed (e.g., stored in secret scopes).
-- **Databricks Scheduling**: You can schedule this notebook as a Databricks Job to run at intervals, so it continuously distributes tasks across VMs. The persistent index in Delta will ensure the round-robin sequence continues across job runs.
-- **Scaling**: This solution assumes a modest number of VMs. The Azure SDK calls are efficient for typical usage. If you have a very large number of VMs, you might consider parallelizing the ping checks or using asynchronous calls. Also, the Delta table approach for a single value is fine for low contention scenarios; for multiple concurrent processes, additional locking might be needed (which is beyond this scope).
-
-By following this guide, you have a Databricks-based orchestrator that lists Azure VMs, pings for availability, selects the next VM in a rotating manner, and triggers a job on it. This pattern can be useful for distributing work to a pool of servers or ensuring high availability by failing over to the next alive VM. Adjust the specifics (such as the job command or selection criteria) as needed for your scenario. 
-
+This notebook provides a complete solution to execute remote shell commands on Azure VMs behind a load balancer and log the outcome with Delta Lake. By leveraging Delta's ACID transactions and merge/upsert capabilities, we maintain reliable log tables that can be queried and upserted efficiently​
+learn.microsoft.com
+. The logging is partitioned by date for manageability and performance. A dedicated notifications table and a Kafka consumer process ensure that important job completions (such as the daily Autosys job run) trigger notifications promptly, without manual intervention. The scheduled ADF/Synapse pipeline triggers this notebook every 15 minutes and once daily at 03:00, automating the entire process end-to-end.
