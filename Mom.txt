@@ -1,0 +1,65 @@
+Overall Goal
+Refactor the VM-selection logic to isolate it in its own function, integrate file-processing notifications, and centralize status logging into a Delta file—all without affecting any unrelated code paths.
+
+VM Selection
+New helper:
+Create a function, e.g. selectAvailableVM(vmList), that:
+Iterates over the provided list of VM objects.
+Pings each VM (3 s timeout).
+Returns an object containing:
+ipAddress: the reachable VM’s IP
+nickname: the VM’s friendly name or alias
+If none respond, returns null (or throws a “No reachable VM” error).
+Integration:
+In the existing entry point (formerly hard-coded to VM1), replace the ping logic with a single call to selectAvailableVM(...).
+Use its returned ipAddress and nickname downstream—no other code should change.
+Trigger & File Processing
+Trigger listener:
+Hook into your event source (e.g., Azure Service Bus or Event Grid) to get the list of files to process.
+Per-file workflow:
+For each incoming file:
+Check if it’s already processed (optional dedupe).
+Process the file payload.
+Determine outcome: success or failure.
+Rename or tag the file by appending _success or _failure to its name.
+Send a notification (e.g., via messaging or log entry) indicating which file ran and its result.
+Status Logging to Delta File
+Delta file setup:
+Path: e.g. /mnt/delta/job_status/ on ADLS Gen2.
+Schema:
+fileName
+jobId
+processingTimestamp
+status ("success" / "failure")
+updateFlag (e.g. Boolean or numeric)
+Utility function:
+Build logJobStatus(fileName, jobId, status, updateFlag) that:
+Creates the Delta file if it doesn’t exist.
+Appends a new record with the above schema.
+Call sites:
+In the “success” branch of your file-processing loop, call logJobStatus(…, "success", …).
+In the “failure” branch, call logJobStatus(…, "failure", …).
+Parameterization & Clean-Code
+No hard-codes:
+All values (VM list, file paths, job IDs, timeouts) must come from function parameters or config.
+Minimal impact:
+Only modify the lines that:
+Call the new selectAvailableVM() function.
+Invoke logJobStatus().
+Append status suffix to file names.
+Leave all other logic untouched.
+Documentation & Comments
+Docstrings:
+For each new function (selectAvailableVM, logJobStatus), include a clear docstring:
+What it takes in, what it returns, and any exceptions it may throw.
+Inline comments:
+At the top of each major block (VM selection, trigger handling, file loop, logging), add a brief comment explaining why we’re doing it.
+High-level narrative:
+In your code repo’s README or at the head of the notebook, include a 3- to 5-sentence overview of the entire flow.
+With this structure, anyone reading the code or documentation will immediately understand:
+
+Where VM selection lives and how it works.
+How files are picked up, processed, and tagged.
+Where and how job statuses are recorded.
+What parameters drive each step.
+Let me know if any detail needs further tweaking!
