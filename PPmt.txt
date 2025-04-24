@@ -1,0 +1,37 @@
+Here's a polished prompt that encapsulates your requirements:
+
+---
+
+"I need assistance with creating an end-to-end project utilizing OpenAI's generative AI model deployed on Azure to generate descriptions based on the attributes of a table. Here are the details:
+
+1. **Source Data**:
+   - I have a PDF containing data with existing descriptions.
+   - Another target table contains attributes; some already have descriptions, while others lack them.
+
+2. **Objective**:
+   - Use the PDF data to train the LLM to understand the pattern and context of existing descriptions.
+   - Automatically generate descriptions for attributes in the target table wherever descriptions are missing, using insights from the training.
+
+3. **Technical Requirements**:
+   - Utilize OpenAI's LLM integrated with Azure services.
+   - Leverage Azure endpoints for API calls to process the data and generate results.
+
+4. **Challenges**:
+   - The PDF data needs to be extracted and processed.
+   - Schema for the other table is loaded but requires integration for description generation.
+
+5. **Deliverables**:
+   - Detailed project implementation steps from start to finish.
+   - Code snippets for data extraction, processing, integration, and description generation.
+   - Workflow design for utilizing the OpenAI LLM and Azure endpoints.
+   - Examples showcasing the process and outputs.
+
+6. **Scope**:
+   - The project should incorporate Azure services efficiently.
+   - Guidance on handling the PDF and schema data, ensuring smooth integration.
+
+Please provide a comprehensive solution, including code, methodology, and any additional recommendations for completing this project."
+
+---
+
+What do you think? I can help brainstorm further ideas or walk through specific sections of this approach!
