@@ -1,73 +1,54 @@
+# 1. Install dependencies (only the first time)
+%pip install pdfminer.six requests
+
+# 2. Imports
 import requests
-import pdfplumber
 import json
-import io
-import sys
-from typing import List, Dict, Any
+from io import BytesIO
+from pdfminer.pdfparser import PDFParser
+from pdfminer.pdfdocument import PDFDocument
+from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+from pdfminer.pdfpage import PDFPage
+from pdfminer.converter import PDFPageAggregator
+from pdfminer.layout import LAParams, LTTextBox, LTTextLine
 
-def download_pdf(sas_url: str) -> bytes:
-    """
-    Fetches the PDF bytes from ADLS via the provided SAS URL.
-    """
-    resp = requests.get(sas_url)
-    resp.raise_for_status()
-    return resp.content
+# 3. Your SAS URL
+sas_url = "https://<your-storage-account>.dfs.core.windows.net/<container>/<path>.pdf?<sas-token>"
 
-def parse_pdf_to_json(pdf_bytes: bytes) -> Dict[str, Any]:
-    """
-    Opens the PDF in-memory and extracts:
-      - page_number
-      - text (full page text)
-      - tables (list of row-lists)
-    Returns a dict suitable for JSON serialization.
-    """
-    document = {"pages": []}
-    
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            # Extract full text
-            text = page.extract_text() or ""
-            
-            # Extract all tables on the page
-            tables: List[List[List[str]]] = []
-            for table in page.extract_tables():
-                # table is a list of rows, each row is list of cell-strings
-                tables.append(table)
-            
-            document["pages"].append({
-                "page_number": i,
-                "text": text,
-                "tables": tables
+# 4. Download PDF into memory
+resp = requests.get(sas_url)
+resp.raise_for_status()
+pdf_stream = BytesIO(resp.content)
+
+# 5. Set up pdfminer parser & device
+parser = PDFParser(pdf_stream)
+doc = PDFDocument(parser)
+rsrcmgr = PDFResourceManager()
+laparams = LAParams()  # tweak if you need finer control over layout analysis
+device = PDFPageAggregator(rsrcmgr, laparams=laparams)
+interpreter = PDFPageInterpreter(rsrcmgr, device)
+
+# 6. Extract every page
+output = []
+for page_no, page in enumerate(PDFPage.create_pages(doc), start=1):
+    interpreter.process_page(page)
+    layout = device.get_result()
+    page_items = []
+    for elem in layout:
+        if isinstance(elem, (LTTextBox, LTTextLine)):
+            page_items.append({
+                "type": elem.__class__.__name__,
+                "bbox": elem.bbox,
+                "text": elem.get_text().rstrip("\n")
             })
-    return document
+    output.append({
+        "page_number": page_no,
+        "items": page_items
+    })
 
-def save_json(obj: Dict[str, Any], path: str):
-    """
-    Writes the given object to a JSON file with pretty formatting.
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# 7. Write JSON to DBFS (Databricks filesystem)
+dbfs_path = "/dbfs/tmp/extracted_pdf.json"
+with open(dbfs_path, "w", encoding="utf-8") as f:
+    json.dump(output, f, indent=2, ensure_ascii=False)
 
-def main(sas_url: str, output_path: str = "output.json"):
-    try:
-        print("⏬ Downloading PDF...")
-        pdf_bytes = download_pdf(sas_url)
-        
-        print("🔍 Parsing PDF content...")
-        doc_json = parse_pdf_to_json(pdf_bytes)
-        
-        print(f"💾 Saving JSON to {output_path}...")
-        save_json(doc_json, output_path)
-        
-        print("✅ Extraction complete!")
-    except Exception as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python pdf_to_json.py <sas_url> [<output_path>]")
-        sys.exit(1)
-    sas_url_arg = sys.argv[1]
-    out_path_arg = sys.argv[2] if len(sys.argv) > 2 else "output.json"
-    main(sas_url_arg, out_path_arg)
+print(f"✅ Extraction complete. JSON file written to {dbfs_path}")
