@@ -1,3 +1,58 @@
+
+import re
+
+def extract_job_names(text):
+    """
+    Given a block of text, use a regex to find all unique
+    Autosys job names of the form WMA_ESL_5481_DEV_DMSH_PRCSSNG_<ID>.
+    """
+    pattern = r'WMA_ESL_5481_DEV_DMSH_PRCSSNG_[A-Z0-9]+'
+    jobs = re.findall(pattern, text)
+    return sorted(set(jobs))
+
+
+def generate_autosys_commands(job_names):
+    """
+    For each job name, generate a tuple of (failure_cmd, success_cmd).
+    """
+    cmds = []
+    for job in job_names:
+        failure = f"sendevent -E CHANGE_STATUS -s FAILURE -J {job};"
+        success = f"sendevent -E STARTJOB           -J {job};"
+        cmds.append((job, failure, success))
+    return cmds
+
+
+if __name__ == "__main__":
+    # Example: paste your SSH snippet here as a multiline string
+    raw_snippet = """
+    sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/esl.env;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_EDCT0800;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_FCSTHIER;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_LSPT0300;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT1200;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT6500;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RCAT5900;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RGMT0600;'
+    """
+
+    # 1. Extract job names
+    jobs = extract_job_names(raw_snippet)
+
+    # 2. Generate failure & success commands
+    commands = generate_autosys_commands(jobs)
+
+    # 3. Print them out
+    for job, fail_cmd, success_cmd in commands:
+        print(f"# {job}")
+        print(fail_cmd)
+        print(success_cmd)
+        print()
+
+
+
+
 Perfect, I understand. I’ll write code that:
 
 - Reads the Delta table from `/mnt/dataops/autosys/`.
