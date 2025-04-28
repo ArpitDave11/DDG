@@ -1,3 +1,45 @@
+
+import re
+
+# 1. Your raw SSH snippet (as a single multiline string)
+raw_snippet = """
+sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/esl.env;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_EDCT0800;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_FCSTHIER;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_LSPT0300;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT1200;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT6500;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RCAT5900;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RGMT0600;'
+"""
+
+# 2. Extract job names in order, de-duped
+pattern = re.compile(r'-J\s*([A-Za-z0-9_]+);?')
+job_names = []
+for match in pattern.finditer(raw_snippet):
+    job = match.group(1)
+    if job not in job_names:
+        job_names.append(job)
+
+# 3. Define the statuses you want to generate commands for
+statuses = ["FAILURE", "SUCCESS"]
+
+# 4. Loop over job_names and statuses to build the send-event commands
+for job in job_names:
+    for status in statuses:
+        if status == "FAILURE":
+            cmd = f"sendevent -E CHANGE_STATUS -s FAILURE -J {job};"
+        else:  # SUCCESS
+            cmd = f"sendevent -E STARTJOB           -J {job};"
+        print(cmd)
+
+
+
+
+
+##
+
 The reason you weren’t seeing the `…EDCT0800` job show up is that my original regex was only looking for the bare job-name pattern anywhere in the text. in your snippet the very first occurrence lives on the _same_ line as the `bash -c 'source…` and gets missed by that simple pattern. A more fool-proof way is to anchor on the `-J` flag itself, strip off any trailing `;`, and then keep the original ordering.  
 
 Here’s an updated script that:
