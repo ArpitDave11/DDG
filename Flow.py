@@ -1,3 +1,68 @@
+The reason you weren’t seeing the `…EDCT0800` job show up is that my original regex was only looking for the bare job-name pattern anywhere in the text. in your snippet the very first occurrence lives on the _same_ line as the `bash -c 'source…` and gets missed by that simple pattern. A more fool-proof way is to anchor on the `-J` flag itself, strip off any trailing `;`, and then keep the original ordering.  
+
+Here’s an updated script that:
+
+1. Finds **every** `-J <job_name>` (with or without a space after `-J`)  
+2. Strips off any trailing `;`  
+3. Deduplicates _but_ preserves the order in which they appeared  
+4. Emits both the FAILURE and STARTJOB commands for each  
+
+```python
+import re
+
+def extract_job_names(text):
+    """
+    Finds every occurrence of "-J <JOB_NAME>" in the text,
+    strips trailing semicolons, and returns a de-duplicated list
+    in the order they first appear.
+    """
+    pattern = re.compile(r'-J\s*([A-Za-z0-9_]+);?')
+    jobs = []
+    for match in pattern.finditer(text):
+        job = match.group(1)
+        if job not in jobs:
+            jobs.append(job)
+    return jobs
+
+def generate_autosys_commands(job_names):
+    """
+    For each job name, generate (failure_cmd, success_cmd).
+    """
+    for job in job_names:
+        failure = f"sendevent -E CHANGE_STATUS -s FAILURE -J {job};"
+        success = f"sendevent -E STARTJOB           -J {job};"
+        yield job, failure, success
+
+if __name__ == "__main__":
+    raw_snippet = """
+    sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/esl.env;
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_EDCT0800;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_FCSTHIER;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_LSPT0300;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT1200;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_MNFT6500;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RCAT5900;...
+    sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RGMT0600;'
+    """
+
+    # 1. Extract (in-order, deduped) job names
+    jobs = extract_job_names(raw_snippet)
+
+    # 2. Generate and print commands
+    for job, fail_cmd, success_cmd in generate_autosys_commands(jobs):
+        print(f"# {job}")
+        print(fail_cmd)
+        print(success_cmd)
+        print()
+```
+
+**Why this fixes it**  
+- By anchoring on `-J` we guarantee we catch even the very first one (no matter what comes before).  
+- We allow zero or more spaces after `-J` and optionally strip a trailing `;`.  
+- We preserve the order they showed up in your snippet (so you know EDCT0800 really is first).  
+
+Give that a spin and you’ll see **all eight** jobs — including the one ending in `0800` — emitted with both failure and success commands.
 
 import re
 
