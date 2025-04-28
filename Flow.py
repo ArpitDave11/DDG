@@ -1,4 +1,108 @@
 
+Perfect. Thanks for confirming.  
+Here’s **the full clean Python code** that will:
+
+- Take your **Spark DataFrame** (with columns `file_name` and `status`)
+- Add the required prefix `"WMA_ESL_5481_DEV_DMSH_PRCSSNG_"` to each file name
+- Generate the correct `sendevent` command based on the status ("SUCCESS" or "FAILURE")
+- Combine **ALL** commands into **one final SSH string**
+- Plug in **owner = eisladmin** and **env = env** in the final sudo command block exactly as you asked.
+
+---
+
+### Full Python Code (Databricks / PySpark Environment)
+
+```python
+from pyspark.sql import SparkSession
+
+# Assume Spark session is already available
+# spark = SparkSession.builder.getOrCreate()
+
+# Example: Your existing Spark DataFrame
+# Let's call it `df`
+# df.show()
+# +---------+--------+
+# |file_name| status |
+# +---------+--------+
+# |EDCT0800 |SUCCESS |
+# |PDBT931Z |FAILURE |
+# |RCAT5900 |SUCCESS |
+# |RGMT0600 |SUCCESS |
+# +---------+--------+
+
+# 1. Collect file_name and status to driver
+records = df.select("file_name", "status").collect()
+
+# 2. Prepare prefix, owner, and environment
+prefix = "WMA_ESL_5481_DEV_DMSH_PRCSSNG_"
+owner = "eisladmin"
+env = "env"
+
+# 3. Generate the sendevent commands
+command_list = []
+
+for row in records:
+    file_name = row['file_name'].strip()
+    status = row['status'].strip().upper()
+    full_job_name = f"{prefix}{file_name}"
+    
+    if status == "SUCCESS":
+        command = f"sendevent -E STARTJOB -J {full_job_name};"
+    elif status == "FAILURE":
+        command = f"sendevent -E CHANGE_STATUS -s FAILURE -J {full_job_name};"
+    else:
+        continue  # If status is neither SUCCESS nor FAILURE, skip
+    
+    command_list.append(command)
+
+# 4. Combine all commands into one SSH string
+commands_combined = "\n".join(command_list)
+
+final_ssh_command = f"""sudo -H -u {owner} bash -c 'source /mnt/ingestion/autosys/{env};
+{commands_combined}'
+"""
+
+# 5. Print the final SSH command
+print(final_ssh_command)
+```
+
+---
+
+### Example Output
+
+If your Spark table has this:
+
+| file_name | status  |
+|-----------|----------|
+| EDCT0800  | SUCCESS  |
+| PDBT931Z  | FAILURE  |
+| RCAT5900  | SUCCESS  |
+| RGMT0600  | SUCCESS  |
+
+**Then final output will be:**
+
+```bash
+sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/env;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_EDCT0800;
+sendevent -E CHANGE_STATUS -s FAILURE -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RCAT5900;
+sendevent -E STARTJOB -J WMA_ESL_5481_DEV_DMSH_PRCSSNG_RGMT0600;'
+```
+
+---
+
+### Notes
+- `.collect()` will pull data to driver — it's safe because your list is small (file names/status).
+- It automatically **adds the prefix** `"WMA_ESL_5481_DEV_DMSH_PRCSSNG_"` to every file name.
+- It **correctly handles** both "SUCCESS" and "FAILURE".
+- If you have statuses other than SUCCESS/FAILURE, those will be skipped.
+
+---
+
+Would you also like me to show a slightly better version where **no manual collect is needed** (using only Spark operations like `withColumn`)? (For large tables, that can be faster.)  
+Shall I also show that? It’s just a tiny improvement!
+
+
 import re
 
 # 1. Your raw SSH snippet (as a single multiline string)
