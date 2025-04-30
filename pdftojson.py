@@ -1,3 +1,96 @@
+another part 
+import fitz  # PyMuPDF
+import pandas as pd
+import sys
+
+pdf_path = 'Mansfield--70-21009048 - ConvertToExcel.pdf'
+try:
+    doc = fitz.open(pdf_path)
+except Exception as e:
+    print(f"❌ Could not open PDF: {e}")
+    sys.exit(1)
+
+all_blocks = []
+
+for page in doc:
+    # 1. Grab all text blocks: each is (x0, y0, x1, y1, text, block_no, block_type)
+    blocks = page.get_text("blocks")
+    if not blocks:
+        continue
+
+    # 2. For each block, extract its words and reassemble in reading order
+    words = page.get_text("words")  # list of (x0, y0, x1, y1, word, block_no, line_no, word_no)
+    for b in blocks:
+        x0, y0, x1, y1, block_text, block_no, block_type = b
+        # only text blocks (block_type == 0)
+        if block_type != 0:
+            continue
+
+        rect = fitz.Rect(x0, y0, x1, y1)
+        # collect words whose bbox falls inside this block rect
+        wlist = [w for w in words if fitz.Rect(w[:4]) in rect]
+        if not wlist:
+            continue
+
+        # sort left→right
+        wlist.sort(key=lambda w: w[0])
+        # group by rounded y1 to form lines
+        lines = {}
+        for w in wlist:
+            y = round(w[3], 1)
+            lines.setdefault(y, []).append(w[4])
+        # sort lines top→bottom, join words
+        text = "\n".join(" ".join(lines[y]) for y in sorted(lines))
+        all_blocks.append(text)
+
+# now split blocks into key/value
+key_vals = []
+for blk in all_blocks:
+    if "\n" in blk:
+        key, val = blk.split("\n", 1)
+    else:
+        parts = blk.split(":", 1)
+        key, val = parts[0], parts[1] if len(parts)>1 else ""
+    key, val = key.strip(), val.strip()
+    # remove unwanted symbols
+    for sym in ("*", "#", ":"):
+        key = key.replace(sym, "")
+        val = val.replace(sym, "")
+    # if purely digits, remove internal spaces
+    if val and not any(c.isalpha() for c in val):
+        val = val.replace(" ", "")
+    key_vals.append((key, val))
+
+# build dict
+report = {k: v for k, v in key_vals}
+
+# special-key logic
+for special in ("LOCALITY", "MANNER OF CRASH COLLISION/IMPACT", "CRASH SEVERITY"):
+    if special in report:
+        v = report[special]
+        segments = []
+        last = 0
+        for i in range(len(v)-1):
+            if v[i+1].isdigit():
+                segments.append(v[last:i+1])
+                last = i+1
+        segments.append(v[last:])
+        # choose last segment by default
+        choice = segments[-1].strip()
+        report[special] = choice
+
+# final DataFrame
+df = pd.DataFrame([report])
+if "VEHICLE IDENTIFICATION" in df.columns:
+    df.at[0, "VEHICLE IDENTIFICATION"] = df.at[0, "VEHICLE IDENTIFICATION"].replace(" ", "")
+
+print(df)
+
+
+
+
+
+###}}}
 Thanks for confirming! I’ll prepare a full, clean end-to-end Python script that uses PyMuPDF to extract text from all annotations in a PDF, process the extracted content, clean it, convert it to a structured dictionary, and finally output it as a pandas DataFrame.
 
 I’ll update you once it’s ready.
