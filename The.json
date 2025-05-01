@@ -1,0 +1,43 @@
+{
+    "name": "PL_DOPS_AUTOSYS_UPDATE",
+    "properties": {
+        "activities": [
+            {
+                "name": "Autosys Command Execution",
+                "type": "DatabricksNotebook",
+                "dependsOn": [],
+                "policy": {
+                    "timeout": "0.5:00:00",
+                    "retry": 1,
+                    "retryIntervalInSeconds": 100,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "notebookPath": "/dhub/dataops/dhub_vm_execute_command",
+                    "baseParameters": {
+                        "load_balancer_id": {
+                            "value": "@pipeline().globalParameters.load_balancer_id",
+                            "type": "Expression"
+                        }
+                    },
+                    "existingClusterId": {
+                        "value": "@pipeline().globalParameters.cluster_id",
+                        "type": "Expression"
+                    }
+                },
+                "linkedServiceName": {
+                    "referenceName": "LS_ADB_DHUB",
+                    "type": "LinkedServiceReference"
+                }
+            }
+        ],
+        "folder": {
+            "name": "3-DATA_OPS"
+        },
+        "annotations": [],
+        "lastPublishTime": "2025-03-05T20:13:29Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
