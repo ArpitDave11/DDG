@@ -1,3 +1,44 @@
+import random
+
+# --- Configuration ---
+# Set this to your environment: 'dev', 'as', or 'prod'
+env = 'dev'
+
+# List of VM hosts to check
+vms = ['10.191.86.77', '10.191.86.78']
+
+
+# --- Reachability Check ---
+reachable = [vm for vm in vms if is_vm_reachable(vm)]
+print("Reachable VMs:", reachable or "None")
+
+
+# --- Selection Logic ---
+if len(reachable) == 2:
+    # Both VMs are reachable → pick one at random
+    selected_vm = random.choice(reachable)
+    print(f"Both VMs reachable. Randomly selected VM: {selected_vm}")
+
+elif len(reachable) == 1:
+    # Only one VM is reachable
+    only_vm = reachable[0]
+    if env == 'dev':
+        # In dev, it's OK to proceed with the single VM
+        selected_vm = only_vm
+        print(f"Dev environment: only one VM reachable. Using VM: {selected_vm}")
+    else:
+        # In non-dev (as/prod), fail if only one VM is up
+        raise Exception(f"Only one VM is available ({only_vm}). "
+                        f"Random selection failed in '{env}' environment.")
+
+else:
+    # No VMs are reachable
+    raise Exception("No reachable VM found in the list.")
+
+
+
+
+
 The following Python script removes the Delta table and round-robin logic. It pings two specified VMs and selects one based on reachability as per the requirements:
 Define a list of two VM hosts.
 Ping both VMs using the is_vm_reachable(vm_host) function (assumed to be defined elsewhere).
