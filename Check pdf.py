@@ -1,219 +1,224 @@
-Thanks for the clarification. I’ll prepare an end-to-end script using LangChain that integrates with your Azure OpenAI deployment using the provided endpoint, subscription key, API version, and base URL. I’ll also implement token limit handling to avoid request failures.
+Thanks for confirming. I’ll now generate a complete, updated Python script that:
 
-I’ll let you know once the script is ready for use in PyCharm.
+* Uses Azure OpenAI via `AzureChatOpenAI` from `langchain_openai` (no deprecated code)
+* Loads your credentials from environment variables
+* Reads model/entity/attribute text from `input.txt`
+* Parses and sends each model section to Azure OpenAI with structured prompts
+* Outputs a final `output.json` file with the correct JSON schema
+
+I’ll make sure it runs cleanly in PyCharm and includes all dependencies and error handling. I’ll notify you when it’s ready.
 
 
-# End-to-End PDF Metadata Extraction with LangChain and Azure OpenAI
+# Azure OpenAI Metadata Extraction Script
 
-## Introduction
+This Python script reads a raw text file of model specifications and uses an Azure-hosted OpenAI model (via LangChain’s AzureChatOpenAI) to extract structured metadata in JSON format. It splits the input text by each **Model** section and prompts the LLM to return the model name, its entities, and their attributes in a JSON structure. The final result is an array of JSON objects (one per model) written to `output.json` and also printed to the console. We include robust error handling for JSON parsing and API errors, and the script uses the latest LangChain interfaces (no deprecated methods).
 
-This guide demonstrates a comprehensive Python script that reads a PDF file and extracts structured metadata (in JSON format) using LangChain integrated with Azure OpenAI. We will use **PyPDFLoader** (a LangChain community PDF loader) to parse the PDF content into text. Next, we'll leverage **AzureChatOpenAI** (LangChain's Azure OpenAI wrapper) to call an Azure-deployed GPT model with your credentials. To enforce the output format, we define a Pydantic data model representing the desired JSON schema and use LangChain's **PydanticOutputParser**, which ensures the LLM’s output conforms to that schema. The script also handles token limits by chunking the PDF text if it's too long, so each chunk stays within the model's context window (e.g. \~4096 tokens for GPT-3.5). This chunking is done using LangChain's recommended **RecursiveCharacterTextSplitter** for splitting text into manageable sections.
+## Installation and Setup
 
-**Output JSON format:** The extracted metadata will be saved as JSON with the exact structure specified in the question:
+Make sure to install the required packages and set up your Azure OpenAI credentials:
 
-```json
-{
-  "Entity": {
-    "TableName": "<TABLE_NAME>",
-    "EntityName": "<ENTITY_NAME>",
-    "Definition": "<SHORT_DESCRIPTION_OF_ENTITY>",
-    "Attributes": [
-      {
-        "Name": "<ATTRIBUTE_FRIENDLY_NAME>",
-        "Definition": "<WHAT_THIS_ATTRIBUTE_MEANS>",
-        "ColumnName": "<PHYSICAL_COLUMN_NAME>",
-        "ColumnType": "<DATA_TYPE>",
-        "PK": "<Yes|No>"
-      }
-    ]
-  }
-}
+```bash
+pip install -U langchain-openai openai
 ```
 
-## Installation
+Set the following environment variables in your system (or in PyCharm run configuration) before running the script:
 
-Make sure to install the required packages (all are publicly available on PyPI) before running the script:
+* **ENDPOINT\_URL** – Your Azure OpenAI endpoint (e.g. `https://<resource-name>.openai.azure.com/`).
+* **DEPLOYMENT\_NAME** – The name of your chat model deployment (e.g. `gpt-4` or `gpt-35-turbo`).
+* **AZURE\_OPENAI\_API\_KEY** – Your Azure OpenAI API key.
+* **OPENAI\_API\_VERSION** – The API version to use (e.g. `2024-12-01-preview`).
 
-* **LangChain** – core library for building LLM applications (`pip install langchain`)
-* **LangChain Community** – community extensions, including PyPDFLoader (`pip install langchain_community`)
-* **OpenAI** – OpenAI Python SDK (required for Azure OpenAI via LangChain, `pip install openai`)
-* **PyPDF** – PDF parser used by PyPDFLoader (`pip install pypdf`)
-* **tiktoken** – *(optional)* tokenizer for counting tokens (`pip install tiktoken`) – useful for precise chunk sizing.
+These correspond to the Azure OpenAI configuration parameters. For example, `AZURE_OPENAI_ENDPOINT` (here provided via `ENDPOINT_URL`) is the base URL of your Azure resource, and `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` (here `DEPLOYMENT_NAME`) is the deployment model name. The script will load these from `os.environ` and pass them to `AzureChatOpenAI` during initialization.
 
-Ensure you have a Python 3.8+ environment for compatibility with LangChain and Pydantic.
+## Approach Outline
 
-## Usage and Credentials Setup
+The script performs the following steps:
 
-Before running the script, gather your Azure OpenAI credentials:
+1. **Read Input File:** It opens `input.txt` (which contains the extracted text from the 141-page PDF) and reads the entire content into a string. It’s assumed that the text uses a consistent format where each model section starts with a line beginning with `"Model : "` followed by the model name.
 
-* **Deployment Name** – the name of your deployed model (e.g., GPT-3.5-Turbo or GPT-4 deployment).
-* **Subscription Key** – your Azure OpenAI API key.
-* **API Version** – the API version to use (matching your deployment, e.g. `"2023-05-15"` or a newer version).
-* **Base URL** – your Azure OpenAI endpoint URL (e.g. `https://<your-resource-name>.openai.azure.com`).
+2. **Split into Sections:** Using the marker `"Model : "` as a delimiter, the script splits the text into sections. Each section corresponds to one model and contains that model’s entities and attributes descriptions. We handle edge cases (like an empty first split result if the text starts with "Model :") by skipping empty chunks.
 
-You can provide these credentials to the script in two ways:
+3. **Initialize Azure OpenAI LLM:** We instantiate an `AzureChatOpenAI` chat model with the appropriate parameters for Azure:
 
-1. **Environment Variables:** Set `AZURE_OPENAI_DEPLOYMENT_NAME`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_API_VERSION`, and `AZURE_OPENAI_ENDPOINT` in your environment (or in PyCharm's run configuration). The script will read from these variables.
-2. **Hard-code in Script:** Alternatively, you can edit the script to directly assign these values to the variables for deployment name, key, version, and endpoint.
+   * `azure_endpoint` – loaded from `ENDPOINT_URL`
+   * `azure_deployment` – loaded from `DEPLOYMENT_NAME`
+   * `openai_api_key` – loaded from `AZURE_OPENAI_API_KEY`
+   * `openai_api_version` – loaded from `OPENAI_API_VERSION`
+   * `temperature=0` for deterministic output (suitable for extraction tasks)
 
-For security, using environment variables is recommended so you don't hard-code secrets.
+   The `AzureChatOpenAI` class reads these settings and prepares the API call to Azure OpenAI. We ensure all required environment variables are present, otherwise the script will alert and stop.
 
-## Solution Overview
+4. **Prepare LLM Prompt:** For each model section, the script constructs a prompt with a **system message** and a **human message**:
 
-The script will perform the following steps:
+   * **SystemMessage:** Establishes the role of the assistant (e.g. *“You are a helpful assistant that extracts structured metadata from text...”*). This primes the model to focus on JSON extraction.
+   * **HumanMessage:** Contains instructions and the raw text of the model section. We explicitly describe the JSON schema we expect (keys for model name, entities, attributes, etc.) and instruct the model to output **only JSON** with no extra commentary. We also note that if a definition is missing in the text, it should output `"No definition available"` for that field.
 
-1. **Load PDF Content:** Use PyPDFLoader to read the PDF file and extract its text content.
-2. **Initialize Azure OpenAI LLM:** Configure LangChain's AzureChatOpenAI with your Azure credentials (deployment name, endpoint, API key, and version) to create an LLM client.
-3. **Define Output Schema:** Define Pydantic models for the Entity and its Attributes to represent the JSON structure. Create a PydanticOutputParser with this model to guide and validate the LLM's output.
-4. **Chunk Text if Necessary:** If the document text is larger than the model's context window (\~4096 tokens for GPT-3.5, \~8192 or more for GPT-4), split the text into smaller chunks. We use LangChain’s RecursiveCharacterTextSplitter, which is recommended for general text chunking, to ensure each chunk fits within the token limit.
-5. **LLM Prompting:** For each chunk (or the whole text if small enough), prompt the Azure OpenAI model to extract the metadata. The prompt will include instructions for the required JSON format (using the output parser's format instructions) and the chunk of text as context.
-6. **Parse and Merge Results:** Parse the LLM's response through the PydanticOutputParser to get a structured `OutputModel` object. If multiple chunks were processed, merge their results – combining attribute lists and ensuring no duplicates – into a single final `Entity` data structure.
-7. **Save to JSON:** Convert the final Pydantic model to JSON and save it to a file (e.g., `output.json`). The saved JSON will follow the exact schema required.
+   Using LangChain’s message classes, we create a list like:
 
-With this approach, even if the PDF is large or contains many attributes, the script processes it in parts and still outputs a single consolidated JSON. The use of a Pydantic schema guarantees the output format is as expected, and any deviation can be caught and handled.
+   ```python
+   messages = [
+       SystemMessage(content="<system instructions>"),
+       HumanMessage(content="<prompt with model text>")
+   ]
+   ```
+
+   Then we call the model with `llm.invoke(messages)` to get the completion. The `.invoke()` method sends the sequence of messages to Azure OpenAI and returns an `AIMessage` response object (which includes the model’s content in `result.content`).
+
+5. **Parse JSON Output:** We take the `result.content` (the model’s answer) and attempt to parse it with Python’s `json.loads()`. The assistant is instructed to return valid JSON only. However, in case the model’s output is not strictly valid JSON (for example, if it included extraneous text or formatting), we have exception handling to catch `json.JSONDecodeError`. In the exception handler, the script will attempt a simple cleanup (such as stripping out any non-JSON text or Markdown code fences) and try parsing again. If it still fails, the script logs an error for that section and skips it.
+
+6. **Collect Results:** Each parsed JSON (a Python dict) for a model is appended to a list `models_data`. The expected structure for each model’s data is:
+
+   ```json
+   {
+     "MODEL_NAME": "Example Model",
+     "entities": [
+       {
+         "ENTITY_NAME": "...",
+         "TABLE_NAME": "...",
+         "DEFINITION": "..."
+       },
+       … 
+     ],
+     "attributes": [
+       {
+         "NAME": "...",
+         "DEFINITION": "...",
+         "COLUMN_NAME": "...",
+         "COLUMN_TYPE": "...",
+         "PK": true/false
+       },
+       … 
+     ]
+   }
+   ```
+
+   If a definition is missing in the input, the model will use `"No definition available"` as the value.
+
+7. **Output to JSON File and Console:** After processing all sections, the script serializes the `models_data` list to pretty-formatted JSON and writes it to `output.json`. It also prints the JSON to the console for immediate viewing.
+
+## Exception Handling
+
+The script includes comprehensive error handling:
+
+* **Environment Errors:** If any required environment variable is missing, it prints an error message and exits, so the user knows to set up credentials properly.
+* **API Call Errors:** The Azure OpenAI invocation is wrapped in a try/except block. Any exception during the API call (e.g. due to incorrect credentials, network issues, or Azure errors) will be caught, logged with the model name, and the script will continue to the next section (instead of crashing).
+* **JSON Decoding Errors:** If the LLM’s response isn’t valid JSON on the first try, the script catches the `JSONDecodeError`. In the handler, we attempt to clean the output (for example, remove \`\`\`json code block markers or stray characters) and parse again. If it still fails, an error is logged and that model’s data is skipped. This way, one malformed section won’t break the entire process.
+
+By handling these exceptions, the script can run to completion and inform you of any issues rather than silently failing.
 
 ## Full Python Script
 
-Below is the full Python script implementing the above steps. You can copy this into a Python file (for example, `extract_metadata.py`) and run it in PyCharm or any environment after installing the required packages. Make sure to update the `PDF_FILE_PATH` and provide your Azure credentials as explained.
+Below is the complete Python script implementing the above logic. You can run this script in PyCharm (or any environment) after installing the packages and setting the environment variables as described. It will produce an `output.json` file with the array of model metadata.
 
-```python
+````python
 import os
+import re
 import json
-# Install langchain and related packages before running this script.
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
-# 1. Azure OpenAI credentials – either set these environment variables or replace the default placeholder strings.
-AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "<YOUR_DEPLOYMENT_NAME>")
-AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "<YOUR_API_KEY>")
-AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "<YOUR_API_VERSION>")
-AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "<YOUR_BASE_URL>")  # e.g. "https://<resource>.openai.azure.com"
+# Ensure required environment variables are present
+required_vars = ["ENDPOINT_URL", "DEPLOYMENT_NAME", "AZURE_OPENAI_API_KEY", "OPENAI_API_VERSION"]
+missing = [var for var in required_vars if not os.getenv(var)]
+if missing:
+    raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
 
-# Ensure all credentials are provided
-if "<YOUR" in AZURE_DEPLOYMENT_NAME or "<YOUR" in AZURE_API_KEY or "<YOUR" in AZURE_API_VERSION or "<YOUR" in AZURE_ENDPOINT:
-    raise ValueError("Please set your Azure OpenAI credentials in the script or as environment variables before running.")
+# Load Azure OpenAI configuration from environment
+endpoint = os.environ["ENDPOINT_URL"]
+deployment = os.environ["DEPLOYMENT_NAME"]
+api_key = os.environ["AZURE_OPENAI_API_KEY"]
+api_version = os.environ["OPENAI_API_VERSION"]
 
-# 2. Initialize the Azure OpenAI LLM via LangChain
-from langchain.chat_models import AzureChatOpenAI
-# Set up the Azure OpenAI chat model with provided credentials
-llm = AzureChatOpenAI(
-    deployment_name=AZURE_DEPLOYMENT_NAME,
-    openai_api_base=AZURE_ENDPOINT,
-    openai_api_version=AZURE_API_VERSION,
-    openai_api_key=AZURE_API_KEY,
-    openai_api_type="azure"   # explicitly denote Azure OpenAI
-)
-
-# 3. Load PDF and extract text using PyPDFLoader
-from langchain_community.document_loaders import PyPDFLoader
-PDF_FILE_PATH = "sample_entity.pdf"  # TODO: replace with your PDF file path
-loader = PyPDFLoader(PDF_FILE_PATH)
-# Load all pages from the PDF into documents
-docs = loader.load()  # returns a list of Documents (one per page, by default)
-# Combine page texts into one string (with page breaks)
-full_text = "\n".join(doc.page_content for doc in docs)
-
-# 4. Define Pydantic models for the expected JSON schema and create an output parser
-from pydantic import BaseModel, Field
-from langchain.output_parsers import PydanticOutputParser
-
-class Attribute(BaseModel):
-    Name: str = Field(..., description="Attribute friendly name")
-    Definition: str = Field(..., description="What this attribute means")
-    ColumnName: str = Field(..., description="Physical column name in the database")
-    ColumnType: str = Field(..., description="Data type of the column")
-    PK: str = Field(..., description="Primary Key indicator (Yes/No)")
-
-class Entity(BaseModel):
-    TableName: str = Field(..., description="Name of the source table")
-    EntityName: str = Field(..., description="Name of the entity")
-    Definition: str = Field(..., description="Short description of the entity")
-    Attributes: list[Attribute] = Field(..., description="List of attributes of the entity")
-
-class OutputModel(BaseModel):
-    Entity: Entity
-
-# Create a Pydantic output parser for the OutputModel
-output_parser = PydanticOutputParser(pydantic_model=OutputModel)
-
-# Prepare the format instructions for the LLM prompt from the parser
-format_instructions = output_parser.get_format_instructions()
-
-# 5. Split text into chunks if it is too large for the model's context window
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# Define chunk size and overlap (tweak these for your model's token limit; using characters as proxy for tokens)
-chunk_size = 3000  # max characters per chunk (roughly ~750 tokens, assuming ~4 chars per token)
-chunk_overlap = 300  # overlap between chunks to avoid cutting important info
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-# Split the full text into chunks (each chunk is a Document with page_content)
-document_chunks = text_splitter.create_documents([full_text])
-
-# 6. Process each chunk with the LLM to extract structured data
-from langchain.schema import HumanMessage, SystemMessage
-
-# System prompt to set the assistant's role and context (helps ensure formatting)
-system_msg = SystemMessage(content="You are a helpful assistant that extracts structured metadata from text. "
-                                   "Follow the output format instructions carefully and output only valid JSON.")
-
-# We will collect parsed results from each chunk
-parsed_chunks = []
-for idx, doc in enumerate(document_chunks, start=1):
-    chunk_text = doc.page_content
-    # Construct the user prompt with format instructions and the chunk content
-    user_prompt = (
-        f"Extract the entity metadata from the following text and output it in the specified JSON format.\n"
-        f"{format_instructions}\n\n"  # instructions for format
-        f"TEXT:\n{chunk_text}"
+# Initialize the Azure OpenAI chat model (LLM) with given credentials
+try:
+    llm = AzureChatOpenAI(
+        azure_endpoint=endpoint,
+        azure_deployment=deployment,
+        openai_api_key=api_key,
+        openai_api_version=api_version,
+        temperature=0  # use deterministic output for extraction
     )
-    # Send system and user messages to the chat model
-    messages = [system_msg, HumanMessage(content=user_prompt)]
-    response = llm(messages=messages)
-    output_text = response.content if hasattr(response, 'content') else str(response)
-    # Parse the LLM output into the Pydantic model (this will validate the JSON structure)
+except Exception as e:
+    # If initialization fails (e.g., invalid credentials), exit with error
+    raise RuntimeError(f"Failed to initialize AzureChatOpenAI: {e}")
+
+# Read the entire input file
+input_file = "input.txt"
+try:
+    with open(input_file, "r", encoding="utf-8") as f:
+        content = f.read()
+except FileNotFoundError:
+    raise FileNotFoundError(f"Input file '{input_file}' not found. Ensure the file exists in the script directory.")
+
+# Split the content by 'Model : ' sections
+sections = content.split("Model : ")
+models_data = []
+
+for idx, section in enumerate(sections):
+    section = section.strip()
+    if not section:
+        continue  # skip empty result (e.g., before the first "Model :")
+    # The first line of each section (after splitting) should be the model name
+    lines = section.splitlines()
+    model_name = lines[0].strip()
+    # The rest of the lines correspond to entities and attributes of this model
+    model_description = "\n".join(lines[1:]).strip()
+
+    # Prepare the system and human messages for the LLM
+    system_msg = SystemMessage(content=(
+        "You are a helpful assistant that extracts structured metadata from text according to a specified JSON format."
+    ))
+    human_msg = HumanMessage(content=(
+        f"Extract the model name, entities, and attributes from the text below and output them in a JSON format with the keys "
+        f"MODEL_NAME, entities, and attributes as described. Each entity should include ENTITY_NAME, TABLE_NAME, and DEFINITION. "
+        f"Each attribute should include NAME, DEFINITION, COLUMN_NAME, COLUMN_TYPE, and PK (use true/false for PK). "
+        f"If a definition is missing in the text, use \"No definition available\" as its value. Do not include any text other than the JSON.\n\n"
+        f"Text to extract from:\n```text\nModel: {model_name}\n{model_description}\n```"
+    ))
+
+    # Call the LLM to get structured metadata for this model
     try:
-        parsed = output_parser.parse(output_text)
+        result_message = llm.invoke([system_msg, human_msg])
     except Exception as e:
-        # If parsing fails, you might print the raw output for debugging
-        raise RuntimeError(f"Failed to parse LLM output for chunk {idx}: {e}\nOutput was: {output_text}")
-    parsed_chunks.append(parsed)
-    print(f"Chunk {idx} processed, extracted {len(parsed.Entity.Attributes)} attributes.")
+        print(f"Error during LLM API call for model '{model_name}': {e}")
+        continue
 
-# 7. Merge results from all chunks into one final Entity
-if not parsed_chunks:
-    raise RuntimeError("No data was extracted from the PDF.")
-# Start with the first chunk's Entity data
-final_entity: Entity = parsed_chunks[0].Entity
-# Merge attributes from subsequent chunks
-all_attributes = list(final_entity.Attributes)
-for parsed in parsed_chunks[1:]:
-    # Skip adding duplicate attributes (by ColumnName or Name)
-    for attr in parsed.Entity.Attributes:
-        if not any(existing.ColumnName == attr.ColumnName for existing in all_attributes):
-            all_attributes.append(attr)
-# Update the final entity's attributes list
-final_entity.Attributes = all_attributes
+    # Get the content of the AI's response
+    response_content = result_message.content if hasattr(result_message, "content") else str(result_message)
 
-# 8. Save the final structured JSON to a file
-output_data = {"Entity": json.loads(final_entity.json())}  # convert Pydantic model to dict
-output_path = "output.json"
-with open(output_path, "w", encoding="utf-8") as f:
-    json.dump(output_data, f, indent=2)
+    # Try to parse the JSON content
+    try:
+        model_data = json.loads(response_content)
+    except json.JSONDecodeError as je:
+        # Attempt to clean minor formatting issues and retry
+        cleaned = response_content.strip()
+        # Remove common extraneous markers like markdown code fences or language tags
+        cleaned = re.sub(r'^```[\w]*\n', '', cleaned)  # remove ```json or ```text at start
+        cleaned = cleaned.rstrip('`')  # remove trailing backticks if any
+        cleaned = cleaned.strip()
+        try:
+            model_data = json.loads(cleaned)
+        except json.JSONDecodeError as je2:
+            print(f"JSON decoding failed for model '{model_name}': {je2}")
+            continue  # skip this model if we cannot parse the output
 
-print(f"Extraction complete! Structured data saved to {output_path}")
-```
+    # Ensure the model name in output matches (or assign if missing)
+    if isinstance(model_data, dict) and "MODEL_NAME" in model_data:
+        # If MODEL_NAME is present but empty, fill it
+        if not model_data["MODEL_NAME"]:
+            model_data["MODEL_NAME"] = model_name
+    else:
+        # If the LLM returned a list or missing key, insert the model name
+        model_data = {"MODEL_NAME": model_name, **(model_data if isinstance(model_data, dict) else {})}
 
-**Notes:**
+    models_data.append(model_data)
 
-* The script uses a `SystemMessage` to instruct the model to only produce JSON output in the correct format. This helps prevent the AI from adding extra commentary.
-* We use a conservative chunk size (`chunk_size=3000` characters) as a proxy to stay within token limits. You may adjust this based on the model's context size (for example, for GPT-4 8k context, you could use a larger chunk size). If you have the `tiktoken` library installed, you could refine this by counting tokens more precisely.
-* The `RecursiveCharacterTextSplitter` is used to split the text into chunks on natural boundaries (paragraphs, sentences, spaces) without breaking words arbitrarily. We include a small overlap (`chunk_overlap=300` chars) so that if an entity attribute description is cut off at the end of a chunk, the next chunk still contains it, reducing the chance of missing or garbling information.
-* We parse each chunk's LLM output with `output_parser.parse()`. This uses the Pydantic model to validate and convert the JSON text into a Python object. If the model returns invalid JSON or missing fields, an exception will be raised, alerting us to adjust the prompt or model parameters.
-* Finally, we merge all attributes from each chunk. We ensure no duplicate attributes are added by checking the `ColumnName` (or you could use the `Name`) field for uniqueness. This way, if an attribute appears in two chunks due to overlap, it will only be included once in the final output.
+# Save the results to output.json
+with open("output.json", "w", encoding="utf-8") as outfile:
+    json.dump(models_data, outfile, indent=2)
 
-## Running the Script
+# Also print the JSON to console
+print(json.dumps(models_data, indent=2))
+````
 
-1. Put the script into a file (e.g., `extract_metadata.py`) and adjust the `PDF_FILE_PATH` to point to your PDF document.
-2. Set your Azure OpenAI credentials as environment variables or fill them in the script.
-3. Run the script (for example, `python extract_metadata.py`). It will connect to Azure OpenAI and process the PDF.
-4. After completion, open the `output.json` file to find the extracted metadata in the specified JSON format. You can further load this JSON in Python or any tool to use the structured data.
-
-By following this approach, you can reliably extract structured entity definitions from PDFs using Azure OpenAI. The combination of LangChain's PDF loader, Azure OpenAI's language models, and Pydantic for output validation provides a powerful end-to-end solution for parsing documents into clean JSON data.
+**How it works:** The script goes through each model section, uses `AzureChatOpenAI.invoke()` with a SystemMessage and HumanMessage prompt to get a JSON snippet, then parses it into Python data. We accumulate all model data in a list and finally output it as JSON. Using LangChain’s `AzureChatOpenAI` ensures we leverage Azure’s hosted GPT model with the given deployment and API version. The use of `SystemMessage` and `HumanMessage` follows LangChain’s recommended practice for chat models, and `.invoke()` sends the messages to the model and returns the assistant’s reply. All sensitive values (keys, endpoint) are loaded from environment variables for security, and no deprecated methods (like `.predict`) are used.
