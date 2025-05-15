@@ -1,224 +1,175 @@
-Thanks for confirming. I’ll now generate a complete, updated Python script that:
-
-* Uses Azure OpenAI via `AzureChatOpenAI` from `langchain_openai` (no deprecated code)
-* Loads your credentials from environment variables
-* Reads model/entity/attribute text from `input.txt`
-* Parses and sends each model section to Azure OpenAI with structured prompts
-* Outputs a final `output.json` file with the correct JSON schema
-
-I’ll make sure it runs cleanly in PyCharm and includes all dependencies and error handling. I’ll notify you when it’s ready.
-
-
-# Azure OpenAI Metadata Extraction Script
-
-This Python script reads a raw text file of model specifications and uses an Azure-hosted OpenAI model (via LangChain’s AzureChatOpenAI) to extract structured metadata in JSON format. It splits the input text by each **Model** section and prompts the LLM to return the model name, its entities, and their attributes in a JSON structure. The final result is an array of JSON objects (one per model) written to `output.json` and also printed to the console. We include robust error handling for JSON parsing and API errors, and the script uses the latest LangChain interfaces (no deprecated methods).
-
-## Installation and Setup
-
-Make sure to install the required packages and set up your Azure OpenAI credentials:
-
-```bash
-pip install -U langchain-openai openai
-```
-
-Set the following environment variables in your system (or in PyCharm run configuration) before running the script:
-
-* **ENDPOINT\_URL** – Your Azure OpenAI endpoint (e.g. `https://<resource-name>.openai.azure.com/`).
-* **DEPLOYMENT\_NAME** – The name of your chat model deployment (e.g. `gpt-4` or `gpt-35-turbo`).
-* **AZURE\_OPENAI\_API\_KEY** – Your Azure OpenAI API key.
-* **OPENAI\_API\_VERSION** – The API version to use (e.g. `2024-12-01-preview`).
-
-These correspond to the Azure OpenAI configuration parameters. For example, `AZURE_OPENAI_ENDPOINT` (here provided via `ENDPOINT_URL`) is the base URL of your Azure resource, and `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` (here `DEPLOYMENT_NAME`) is the deployment model name. The script will load these from `os.environ` and pass them to `AzureChatOpenAI` during initialization.
-
-## Approach Outline
-
-The script performs the following steps:
-
-1. **Read Input File:** It opens `input.txt` (which contains the extracted text from the 141-page PDF) and reads the entire content into a string. It’s assumed that the text uses a consistent format where each model section starts with a line beginning with `"Model : "` followed by the model name.
-
-2. **Split into Sections:** Using the marker `"Model : "` as a delimiter, the script splits the text into sections. Each section corresponds to one model and contains that model’s entities and attributes descriptions. We handle edge cases (like an empty first split result if the text starts with "Model :") by skipping empty chunks.
-
-3. **Initialize Azure OpenAI LLM:** We instantiate an `AzureChatOpenAI` chat model with the appropriate parameters for Azure:
-
-   * `azure_endpoint` – loaded from `ENDPOINT_URL`
-   * `azure_deployment` – loaded from `DEPLOYMENT_NAME`
-   * `openai_api_key` – loaded from `AZURE_OPENAI_API_KEY`
-   * `openai_api_version` – loaded from `OPENAI_API_VERSION`
-   * `temperature=0` for deterministic output (suitable for extraction tasks)
-
-   The `AzureChatOpenAI` class reads these settings and prepares the API call to Azure OpenAI. We ensure all required environment variables are present, otherwise the script will alert and stop.
-
-4. **Prepare LLM Prompt:** For each model section, the script constructs a prompt with a **system message** and a **human message**:
-
-   * **SystemMessage:** Establishes the role of the assistant (e.g. *“You are a helpful assistant that extracts structured metadata from text...”*). This primes the model to focus on JSON extraction.
-   * **HumanMessage:** Contains instructions and the raw text of the model section. We explicitly describe the JSON schema we expect (keys for model name, entities, attributes, etc.) and instruct the model to output **only JSON** with no extra commentary. We also note that if a definition is missing in the text, it should output `"No definition available"` for that field.
-
-   Using LangChain’s message classes, we create a list like:
-
-   ```python
-   messages = [
-       SystemMessage(content="<system instructions>"),
-       HumanMessage(content="<prompt with model text>")
-   ]
-   ```
-
-   Then we call the model with `llm.invoke(messages)` to get the completion. The `.invoke()` method sends the sequence of messages to Azure OpenAI and returns an `AIMessage` response object (which includes the model’s content in `result.content`).
-
-5. **Parse JSON Output:** We take the `result.content` (the model’s answer) and attempt to parse it with Python’s `json.loads()`. The assistant is instructed to return valid JSON only. However, in case the model’s output is not strictly valid JSON (for example, if it included extraneous text or formatting), we have exception handling to catch `json.JSONDecodeError`. In the exception handler, the script will attempt a simple cleanup (such as stripping out any non-JSON text or Markdown code fences) and try parsing again. If it still fails, the script logs an error for that section and skips it.
-
-6. **Collect Results:** Each parsed JSON (a Python dict) for a model is appended to a list `models_data`. The expected structure for each model’s data is:
-
-   ```json
-   {
-     "MODEL_NAME": "Example Model",
-     "entities": [
-       {
-         "ENTITY_NAME": "...",
-         "TABLE_NAME": "...",
-         "DEFINITION": "..."
-       },
-       … 
-     ],
-     "attributes": [
-       {
-         "NAME": "...",
-         "DEFINITION": "...",
-         "COLUMN_NAME": "...",
-         "COLUMN_TYPE": "...",
-         "PK": true/false
-       },
-       … 
-     ]
-   }
-   ```
-
-   If a definition is missing in the input, the model will use `"No definition available"` as the value.
-
-7. **Output to JSON File and Console:** After processing all sections, the script serializes the `models_data` list to pretty-formatted JSON and writes it to `output.json`. It also prints the JSON to the console for immediate viewing.
-
-## Exception Handling
-
-The script includes comprehensive error handling:
-
-* **Environment Errors:** If any required environment variable is missing, it prints an error message and exits, so the user knows to set up credentials properly.
-* **API Call Errors:** The Azure OpenAI invocation is wrapped in a try/except block. Any exception during the API call (e.g. due to incorrect credentials, network issues, or Azure errors) will be caught, logged with the model name, and the script will continue to the next section (instead of crashing).
-* **JSON Decoding Errors:** If the LLM’s response isn’t valid JSON on the first try, the script catches the `JSONDecodeError`. In the handler, we attempt to clean the output (for example, remove \`\`\`json code block markers or stray characters) and parse again. If it still fails, an error is logged and that model’s data is skipped. This way, one malformed section won’t break the entire process.
-
-By handling these exceptions, the script can run to completion and inform you of any issues rather than silently failing.
-
-## Full Python Script
-
-Below is the complete Python script implementing the above logic. You can run this script in PyCharm (or any environment) after installing the packages and setting the environment variables as described. It will produce an `output.json` file with the array of model metadata.
-
-````python
 import os
 import re
 import json
-from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 
-# Ensure required environment variables are present
-required_vars = ["ENDPOINT_URL", "DEPLOYMENT_NAME", "AZURE_OPENAI_API_KEY", "OPENAI_API_VERSION"]
-missing = [var for var in required_vars if not os.getenv(var)]
-if missing:
-    raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
-
-# Load Azure OpenAI configuration from environment
-endpoint = os.environ["ENDPOINT_URL"]
-deployment = os.environ["DEPLOYMENT_NAME"]
-api_key = os.environ["AZURE_OPENAI_API_KEY"]
-api_version = os.environ["OPENAI_API_VERSION"]
-
-# Initialize the Azure OpenAI chat model (LLM) with given credentials
+# 1. Load PDF and extract full text
 try:
-    llm = AzureChatOpenAI(
-        azure_endpoint=endpoint,
-        azure_deployment=deployment,
-        openai_api_key=api_key,
-        openai_api_version=api_version,
-        temperature=0  # use deterministic output for extraction
-    )
-except Exception as e:
-    # If initialization fails (e.g., invalid credentials), exit with error
-    raise RuntimeError(f"Failed to initialize AzureChatOpenAI: {e}")
+    from PyPDF2 import PdfReader
+except ImportError:
+    import subprocess
+    subprocess.run(["pip", "install", "PyPDF2"], check=True)
+    from PyPDF2 import PdfReader
 
-# Read the entire input file
-input_file = "input.txt"
-try:
-    with open(input_file, "r", encoding="utf-8") as f:
-        content = f.read()
-except FileNotFoundError:
-    raise FileNotFoundError(f"Input file '{input_file}' not found. Ensure the file exists in the script directory.")
+pdf_path = "/dbfs/mnt/genai/knowledge_base/Data_Dictionary-pdf"
+reader = PdfReader(pdf_path)
+text_content = ""
+for page in reader.pages:
+    page_text = page.extract_text()
+    if page_text:
+        text_content += page_text + "\n"
 
-# Split the content by 'Model : ' sections
-sections = content.split("Model : ")
-models_data = []
+# 2. Identify and separate sections by "Model :"
+# Find the first occurrence of "Model :" and ignore anything before it (preface or intro)
+first_model_index = text_content.find("Model :")
+if first_model_index == -1:
+    raise ValueError("No 'Model :' section found in the PDF text.")
+if first_model_index > 0:
+    text_content = text_content[first_model_index:]
 
-for idx, section in enumerate(sections):
-    section = section.strip()
-    if not section:
-        continue  # skip empty result (e.g., before the first "Model :")
-    # The first line of each section (after splitting) should be the model name
-    lines = section.splitlines()
-    model_name = lines[0].strip()
-    # The rest of the lines correspond to entities and attributes of this model
-    model_description = "\n".join(lines[1:]).strip()
+# Find all indices where a model section starts
+model_positions = [m.start() for m in re.finditer(r'Model\s*:\s*', text_content)]
+model_positions.append(len(text_content))  # add end of text as last boundary
 
-    # Prepare the system and human messages for the LLM
-    system_msg = SystemMessage(content=(
-        "You are a helpful assistant that extracts structured metadata from text according to a specified JSON format."
-    ))
-    human_msg = HumanMessage(content=(
-        f"Extract the model name, entities, and attributes from the text below and output them in a JSON format with the keys "
-        f"MODEL_NAME, entities, and attributes as described. Each entity should include ENTITY_NAME, TABLE_NAME, and DEFINITION. "
-        f"Each attribute should include NAME, DEFINITION, COLUMN_NAME, COLUMN_TYPE, and PK (use true/false for PK). "
-        f"If a definition is missing in the text, use \"No definition available\" as its value. Do not include any text other than the JSON.\n\n"
-        f"Text to extract from:\n```text\nModel: {model_name}\n{model_description}\n```"
-    ))
-
-    # Call the LLM to get structured metadata for this model
-    try:
-        result_message = llm.invoke([system_msg, human_msg])
-    except Exception as e:
-        print(f"Error during LLM API call for model '{model_name}': {e}")
+# Slice out each model section text
+model_sections = []
+for i in range(len(model_positions) - 1):
+    section_text = text_content[model_positions[i]: model_positions[i+1]]
+    section_text = section_text.strip()
+    if not section_text:
         continue
+    model_sections.append(section_text)
 
-    # Get the content of the AI's response
-    response_content = result_message.content if hasattr(result_message, "content") else str(result_message)
+# Ensure we have at least one model section
+if not model_sections:
+    raise ValueError("No model sections could be extracted from the text.")
 
-    # Try to parse the JSON content
+# 3. Set up Azure OpenAI LLM (AzureChatOpenAI) with environment variables
+endpoint = os.getenv("ENDPOINT_URL")
+deployment = os.getenv("DEPLOYMENT_NAME")
+api_key = os.getenv("AZURE_OPENAI_API_KEY")
+api_version = os.getenv("OPENAI_API_VERSION")
+if not endpoint or not deployment or not api_key or not api_version:
+    raise EnvironmentError(
+        "Missing one of the required Azure OpenAI environment variables: "
+        "ENDPOINT_URL, DEPLOYMENT_NAME, AZURE_OPENAI_API_KEY, OPENAI_API_VERSION."
+    )
+
+# Map the provided env vars to those expected by AzureChatOpenAI
+os.environ["AZURE_OPENAI_ENDPOINT"] = endpoint
+os.environ["AZURE_OPENAI_API_KEY"] = api_key
+# We will pass the deployment name and API version directly to the AzureChatOpenAI initializer
+
+try:
+    from langchain_openai import AzureChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage
+except ImportError:
+    import subprocess
+    subprocess.run(["pip", "install", "langchain-openai"], check=True)
+    from langchain_openai import AzureChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage
+
+# Initialize the AzureChatOpenAI LLM
+llm = AzureChatOpenAI(
+    azure_deployment=deployment,
+    api_version=api_version,
+    temperature=0
+)
+
+# 4. Define the system prompt for parsing instructions
+system_prompt = (
+    "You are an assistant that extracts structured data from a data dictionary document.\n"
+    "The user will provide text for a data model, including the model name and one or more entities with attributes.\n"
+    "Your task is to output a JSON **array** of objects, where each object represents one entity from the text with the following format:\n"
+    "{\n"
+    '  "Model": "<Model Name>",\n'
+    '  "Entity": {\n'
+    '    "TABLE_NAME": "<table name of the entity or \'Not available\'>",\n'
+    '    "ENTITY NAME": "<entity name or \'Not available\'>",\n'
+    '    "DEFINITION": "<entity definition or \'No definition available\'>"\n'
+    '  },\n'
+    '  "Attributes": [\n'
+    '    {\n'
+    '      "NAME": "<attribute name or \'Not available\'>",\n'
+    '      "DEFINITION": "<attribute definition or \'No definition available\'>",\n'
+    '      "Column Name": "<column name or \'Not available\'>",\n'
+    '      "Column Data Type": "<column data type or \'Not available\'>",\n'
+    '      "PK?": "<Yes or No or \'Not available\'>"\n'
+    '    }, ...\n'
+    '  ]\n'
+    '}\n'
+    "Include **all** entities and their attributes from the input text. Do not skip any.\n"
+    "If any field value is missing in the text, use \"Not available\" (for general fields) or \"No definition available\" (for missing definitions).\n"
+    "Do not add explanations or any extra text outside of the JSON. Only output the JSON data structure as specified.\n"
+    "Use the exact key names and formatting shown (e.g., \"ENTITY NAME\" with a space, \"PK?\" with a question mark)."
+)
+
+# 5. Parse each model section with the LLM and collect results
+all_entities = []  # list to hold all entity JSON objects
+for section in model_sections:
+    # Prepare messages for the LLM: system instructions + human prompt with the section text
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=section)
+    ]
+    # Invoke the Azure OpenAI model to get the parsed JSON output
+    response = llm.invoke(messages)  # :contentReference[oaicite:5]{index=5}
+    output_text = response.content
+
+    # Attempt to load the response content as JSON
     try:
-        model_data = json.loads(response_content)
-    except json.JSONDecodeError as je:
-        # Attempt to clean minor formatting issues and retry
-        cleaned = response_content.strip()
-        # Remove common extraneous markers like markdown code fences or language tags
-        cleaned = re.sub(r'^```[\w]*\n', '', cleaned)  # remove ```json or ```text at start
-        cleaned = cleaned.rstrip('`')  # remove trailing backticks if any
-        cleaned = cleaned.strip()
+        parsed_output = json.loads(output_text)
+    except json.JSONDecodeError:
+        # If the model response is not directly parseable, try minor cleanup (e.g., remove code fences)
+        cleaned = output_text.strip().strip("```").strip()
         try:
-            model_data = json.loads(cleaned)
-        except json.JSONDecodeError as je2:
-            print(f"JSON decoding failed for model '{model_name}': {je2}")
-            continue  # skip this model if we cannot parse the output
+            parsed_output = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON from LLM output: {e}\nModel output was: {output_text}")
 
-    # Ensure the model name in output matches (or assign if missing)
-    if isinstance(model_data, dict) and "MODEL_NAME" in model_data:
-        # If MODEL_NAME is present but empty, fill it
-        if not model_data["MODEL_NAME"]:
-            model_data["MODEL_NAME"] = model_name
-    else:
-        # If the LLM returned a list or missing key, insert the model name
-        model_data = {"MODEL_NAME": model_name, **(model_data if isinstance(model_data, dict) else {})}
+    # The model is instructed to return a JSON array of entities.
+    # If it returned a single object (in case of one entity), wrap it into a list for consistency.
+    if isinstance(parsed_output, dict):
+        parsed_output = [parsed_output]
+    elif not isinstance(parsed_output, list):
+        raise ValueError("Unexpected JSON output format from LLM (expected list of objects).")
 
-    models_data.append(model_data)
+    # Append each entity object to the master list
+    for entity_obj in parsed_output:
+        # Ensure required keys exist, fill placeholders if missing (safety check, model should handle this)
+        if "Model" not in entity_obj:
+            entity_obj["Model"] = "Not available"
+        if "Entity" not in entity_obj:
+            entity_obj["Entity"] = {"TABLE_NAME": "Not available", "ENTITY NAME": "Not available", "DEFINITION": "No definition available"}
+        if "Attributes" not in entity_obj:
+            entity_obj["Attributes"] = []
+        # Also ensure within Entity, each key exists
+        ent = entity_obj["Entity"]
+        if "TABLE_NAME" not in ent:
+            ent["TABLE_NAME"] = "Not available"
+        if "ENTITY NAME" not in ent:
+            ent["ENTITY NAME"] = "Not available"
+        if "DEFINITION" not in ent:
+            ent["DEFINITION"] = "No definition available"
+        # For each attribute in the list, ensure all keys are present
+        for attr in entity_obj.get("Attributes", []):
+            if "NAME" not in attr:
+                attr["NAME"] = "Not available"
+            if "DEFINITION" not in attr:
+                attr["DEFINITION"] = "No definition available"
+            if "Column Name" not in attr:
+                attr["Column Name"] = "Not available"
+            if "Column Data Type" not in attr:
+                attr["Column Data Type"] = "Not available"
+            if "PK?" not in attr:
+                attr["PK?"] = "Not available"
 
-# Save the results to output.json
-with open("output.json", "w", encoding="utf-8") as outfile:
-    json.dump(models_data, outfile, indent=2)
+        all_entities.append(entity_obj)
 
-# Also print the JSON to console
-print(json.dumps(models_data, indent=2))
-````
+# 6. Write the results to output.jsonl (each entity as one JSON line)
+output_path = "output.jsonl"
+with open(output_path, "w") as outfile:
+    for entity_obj in all_entities:
+        json.dump(entity_obj, outfile)
+        outfile.write("\n")
 
-**How it works:** The script goes through each model section, uses `AzureChatOpenAI.invoke()` with a SystemMessage and HumanMessage prompt to get a JSON snippet, then parses it into Python data. We accumulate all model data in a list and finally output it as JSON. Using LangChain’s `AzureChatOpenAI` ensures we leverage Azure’s hosted GPT model with the given deployment and API version. The use of `SystemMessage` and `HumanMessage` follows LangChain’s recommended practice for chat models, and `.invoke()` sends the messages to the model and returns the assistant’s reply. All sensitive values (keys, endpoint) are loaded from environment variables for security, and no deprecated methods (like `.predict`) are used.
+print(f"Parsing complete. JSONL output saved to {output_path}")
