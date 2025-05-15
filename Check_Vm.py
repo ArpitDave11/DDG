@@ -1,3 +1,52 @@
+import re
+
+# … your existing imports, getToken(), variables, etc. …
+
+def send_and_wait(cmd):
+    """
+    This is your existing block that does:
+      • builds `body = {"commandId": …, "script": [cmd]}`, 
+      • calls requests.post(...),
+      • polls Azure-AsyncOperation until succeeded/failed,
+      • raises on failure.
+    Keep this exactly as you have it now.
+    """
+    # <— paste your existing request/post + polling code here,
+    # using `cmd` in place of your current `command` variable.
+    pass  # <<— replace with your logic
+
+# … right before you build `body` and call your existing code …  
+# assume `command` is your full multi-cmd string
+
+# 1) Detect and extract the DATEFLE job
+if "WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE" in command:
+    # split on semicolons or newlines
+    parts = [p.strip() for p in re.split(r"[;\n]+", command) if p.strip()]
+    # isolate the DATEFLE command
+    datefle = next(p for p in parts if "WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE" in p)
+    # re-join the rest
+    others = "; ".join(p for p in parts if p != datefle)
+
+    # optional: preserve your chmod logic if DATEFLE needs it
+    if "DATEFLE" in datefle:
+        datefle = "chmod 777 /mnt/ingestion/autosys/inactive.sh; " + datefle
+
+    # 2) Run DATEFLE first
+    send_and_wait(datefle)
+
+    # 3) Once that succeeds, run everything else (if any)
+    if others:
+        # if your existing code also prepends chmod on any DATEFLE in the rest, you can reapply here
+        send_and_wait(others)
+
+else:
+    # no DATEFLE: behave exactly as before
+    send_and_wait(command)
+
+
+
+
+###########
 import os
 import itertools
 import subprocess
