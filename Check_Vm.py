@@ -1,99 +1,105 @@
-#!/usr/bin/env python3
 import requests
+import json
 import time
-import logging
-import re
-from azure.identity import DefaultAzureCredential
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION — fill in or set via environment for DefaultAzureCredential
-# -----------------------------------------------------------------------------
-SUBSCRIPTION_ID     = "<YOUR_SUBSCRIPTION_ID>"
-RESOURCE_GROUP_NAME = "<YOUR_RESOURCE_GROUP>"
-VM_NAME             = "<YOUR_VM_NAME>"
-API_VERSION         = "2021-04-01"   # appropriate Compute RunCommand API version
+# ————————————————————————————————————————————————
+# Your existing variables (keep these names)
+# ————————————————————————————————————————————————
+subscription_id      = "<YOUR_SUBSCRIPTION_ID>"
+resource_group_name  = "<YOUR_RESOURCE_GROUP>"
+vm_name              = "<YOUR_VM_NAME>"
+tenant               = "<YOUR_TENANT_ID>"
 
-# -----------------------------------------------------------------------------
-# AUTHENTICATION
-# -----------------------------------------------------------------------------
-# Uses azure-identity DefaultAzureCredential, which supports:
-#  • Environment variables (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET)
-#  • Managed identity if running in Azure VM/App Service/etc.
-credential   = DefaultAzureCredential()
-token        = credential.get_token("https://management.azure.com/.default")
-ACCESS_TOKEN = token.token
+# The full shell command string you currently build
+# (potentially many commands separated by semicolons or newlines)
+command = """
+sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/es1.env;
+sendevent -E STARTJOB -J WMALESL_5481_DEV_DMSH_PRCSSNG_LSPT0100;
+WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE --option xyz;
+sendevent -E CHANGE_STATUS -S FAILURE -J WMALESL_5481_DEV_DMSH_PRCSSNG_MNF1200;
+sendevent -E STARTJOB -J WMALESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;
+'
+"""
 
-# -----------------------------------------------------------------------------
-# ENDPOINT & HEADERS
-# -----------------------------------------------------------------------------
-RUN_COMMAND_URL = (
-    f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}"
-    f"/resourceGroups/{RESOURCE_GROUP_NAME}"
-    f"/providers/Microsoft.Compute/virtualMachines/{VM_NAME}"
-    f"/runCommand?api-version={API_VERSION}"
+# ————————————————————————————————————————————————
+# Build your RunCommand URL & headers exactly as before
+# ————————————————————————————————————————————————
+url = (
+    f"https://management.azure.com/subscriptions/{subscription_id}"
+    f"/resourceGroups/{resource_group_name}"
+    f"/providers/Microsoft.Compute/virtualMachines/{vm_name}"
+    f"/runCommand?api-version=2021-04-01"
 )
 
-HEADERS = {
-    "Content-Type":  "application/json",
-    "Authorization": f"Bearer {ACCESS_TOKEN}"
+headers = {
+    "Authorization": "Bearer " + getToken(tenant, subscription_id),
+    "Content-Type":  "application/json"
 }
 
-# -----------------------------------------------------------------------------
-# LOGGING
-# -----------------------------------------------------------------------------
-logging.basicConfig(
-    level    = logging.INFO,
-    format   = "%(asctime)s %(levelname)s %(message)s",
-    datefmt  = "%Y-%m-%d %H:%M:%S"
-)
-
-# -----------------------------------------------------------------------------
-# CORE HELPER: send a single shell-script command via RunCommand and poll till done
-# -----------------------------------------------------------------------------
-def send_and_wait(cmd_text, timeout=600, poll_interval=5):
-    """
-    1) POSTs to Azure VM RunCommand with RunShellScript and your `cmd_text`
-    2) If 202 Accepted, polls the Azure-AsyncOperation URL until status == 'Succeeded'
-    3) Raises Exception on HTTP errors, timeouts, or 'Failed' statuses
-    """
+# ————————————————————————————————————————————————
+# Helper: send one cmd and poll until it succeeds/fails
+# ————————————————————————————————————————————————
+def send_and_wait(cmd_text):
     body = {
         "commandId": "RunShellScript",
         "script":    [cmd_text]
     }
-    logging.info(f"→ Sending RunCommand: {cmd_text!r}")
-    resp = requests.post(RUN_COMMAND_URL, headers=HEADERS, json=body)
-    if resp.status_code in (200, 201):
-        logging.info("✔ Command completed synchronously.")
-        return
+    print(f"→ Executing: {cmd_text!r}")
+    response = requests.post(url, headers=headers, json=body)
+    print("Status code:", response.status_code)
+    
+    if response.status_code != 202:
+        raise Exception(f"Command execution failed with status {response.status_code}: {response.text!r}")
 
-    if resp.status_code != 202:
-        raise RuntimeError(f"RunCommand failed [{resp.status_code}]: {resp.text!r}")
+    operation_id = response.headers.get("Azure-AsyncOperation")
+    if not operation_id:
+        operation_id = response.headers.get("Location")
+    if not operation_id:
+        raise Exception("Missing Azure-AsyncOperation/Location header for polling.")
 
-    # async case: extract polling URL
-    poll_url = resp.headers.get("Azure-AsyncOperation") or resp.headers.get("Location")
-    if not poll_url:
-        raise RuntimeError("Missing Azure-AsyncOperation/Location header for polling.")
-
-    logging.info(f"↻ Polling async status at {poll_url}")
-    start = time.time()
+    check_url = f"{operation_id}?api-version=2021-04-01"
     while True:
-        poll_resp = requests.get(poll_url, headers=HEADERS)
-        if poll_resp.status_code not in (200, 202):
-            raise RuntimeError(f"Polling error [{poll_resp.status_code}]: {poll_resp.text!r}")
+        check_response = requests.get(check_url, headers=headers)
+        if check_response.status_code == 200:
+            status = check_response.json().get("status", "").lower()
+            print(f"  • status = {status}")
+            if status == "succeeded":
+                print("✔ Command executed successfully")
+                break
+            if status == "failed":
+                raise Exception(f"Command execution failed: {check_response.text!r}")
+        else:
+            print(f"Warning: polling returned {check_response.status_code}: {check_response.text!r}")
 
-        status = poll_resp.json().get("status", "").lower()
-        logging.info(f"  • status = {status.capitalize()}")
-        if status == "succeeded":
-            logging.info("✔ Async operation succeeded.")
-            return
-        if status in ("failed", "canceled"):
-            raise RuntimeError(f"✖ Async operation {status}. Details: {poll_resp.text!r}")
+        # only use this timing
+        time.sleep(20)
 
-        if time.time() - start > timeout:
-            raise RuntimeError("✖ Timeout waiting for RunCommand to complete.")
+# ————————————————————————————————————————————————
+# Main logic: run DATEFLE job first if present, else everything together
+# ————————————————————————————————————————————————
+marker = "WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE"
 
-        time.sleep(poll_interval)
+if marker in command:
+    # split on semicolons or newlines
+    parts = [p.strip() for p in command.replace("\n", ";").split(";") if p.strip()]
+    # isolate the DATEFLE command
+    datefle_cmd = next(p for p in parts if marker in p)
+    others = "; ".join(p for p in parts if p != datefle_cmd)
 
+    # preserve your chmod logic if needed
+    if "DATEFLE" in datefle_cmd:
+        datefle_cmd = "chmod 777 /mnt/ingestion/autosys/inactive.sh; " + datefle_cmd
+
+    # 1) run the DATEFLE job first
+    send_and_wait(datefle_cmd)
+
+    # 2) then run all the rest in one shot
+    if others:
+        send_and_wait(others)
+
+else:
+    # no DATEFLE: exactly your original behavior
+    send_and_wait(command)
 
 # -----------------------------------------------------------------------------
 # PRIMARY ENTRY: handles the special DATEFLE-first logic, then delegates to send_and_wait()
