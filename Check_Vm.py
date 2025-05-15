@@ -1,3 +1,158 @@
+#!/usr/bin/env python3
+import requests
+import time
+import logging
+import re
+from azure.identity import DefaultAzureCredential
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION — fill in or set via environment for DefaultAzureCredential
+# -----------------------------------------------------------------------------
+SUBSCRIPTION_ID     = "<YOUR_SUBSCRIPTION_ID>"
+RESOURCE_GROUP_NAME = "<YOUR_RESOURCE_GROUP>"
+VM_NAME             = "<YOUR_VM_NAME>"
+API_VERSION         = "2021-04-01"   # appropriate Compute RunCommand API version
+
+# -----------------------------------------------------------------------------
+# AUTHENTICATION
+# -----------------------------------------------------------------------------
+# Uses azure-identity DefaultAzureCredential, which supports:
+#  • Environment variables (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET)
+#  • Managed identity if running in Azure VM/App Service/etc.
+credential   = DefaultAzureCredential()
+token        = credential.get_token("https://management.azure.com/.default")
+ACCESS_TOKEN = token.token
+
+# -----------------------------------------------------------------------------
+# ENDPOINT & HEADERS
+# -----------------------------------------------------------------------------
+RUN_COMMAND_URL = (
+    f"https://management.azure.com/subscriptions/{SUBSCRIPTION_ID}"
+    f"/resourceGroups/{RESOURCE_GROUP_NAME}"
+    f"/providers/Microsoft.Compute/virtualMachines/{VM_NAME}"
+    f"/runCommand?api-version={API_VERSION}"
+)
+
+HEADERS = {
+    "Content-Type":  "application/json",
+    "Authorization": f"Bearer {ACCESS_TOKEN}"
+}
+
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level    = logging.INFO,
+    format   = "%(asctime)s %(levelname)s %(message)s",
+    datefmt  = "%Y-%m-%d %H:%M:%S"
+)
+
+# -----------------------------------------------------------------------------
+# CORE HELPER: send a single shell-script command via RunCommand and poll till done
+# -----------------------------------------------------------------------------
+def send_and_wait(cmd_text, timeout=600, poll_interval=5):
+    """
+    1) POSTs to Azure VM RunCommand with RunShellScript and your `cmd_text`
+    2) If 202 Accepted, polls the Azure-AsyncOperation URL until status == 'Succeeded'
+    3) Raises Exception on HTTP errors, timeouts, or 'Failed' statuses
+    """
+    body = {
+        "commandId": "RunShellScript",
+        "script":    [cmd_text]
+    }
+    logging.info(f"→ Sending RunCommand: {cmd_text!r}")
+    resp = requests.post(RUN_COMMAND_URL, headers=HEADERS, json=body)
+    if resp.status_code in (200, 201):
+        logging.info("✔ Command completed synchronously.")
+        return
+
+    if resp.status_code != 202:
+        raise RuntimeError(f"RunCommand failed [{resp.status_code}]: {resp.text!r}")
+
+    # async case: extract polling URL
+    poll_url = resp.headers.get("Azure-AsyncOperation") or resp.headers.get("Location")
+    if not poll_url:
+        raise RuntimeError("Missing Azure-AsyncOperation/Location header for polling.")
+
+    logging.info(f"↻ Polling async status at {poll_url}")
+    start = time.time()
+    while True:
+        poll_resp = requests.get(poll_url, headers=HEADERS)
+        if poll_resp.status_code not in (200, 202):
+            raise RuntimeError(f"Polling error [{poll_resp.status_code}]: {poll_resp.text!r}")
+
+        status = poll_resp.json().get("status", "").lower()
+        logging.info(f"  • status = {status.capitalize()}")
+        if status == "succeeded":
+            logging.info("✔ Async operation succeeded.")
+            return
+        if status in ("failed", "canceled"):
+            raise RuntimeError(f"✖ Async operation {status}. Details: {poll_resp.text!r}")
+
+        if time.time() - start > timeout:
+            raise RuntimeError("✖ Timeout waiting for RunCommand to complete.")
+
+        time.sleep(poll_interval)
+
+
+# -----------------------------------------------------------------------------
+# PRIMARY ENTRY: handles the special DATEFLE-first logic, then delegates to send_and_wait()
+# -----------------------------------------------------------------------------
+def execute_commands(command_str):
+    """
+    1) If command_str contains the special marker, split it into individual commands,
+       extract + run the DATEFLE one first; wait for success.
+    2) Then run the rest in one go.
+    3) If no special marker, run command_str as-is.
+    """
+    SPECIAL = "WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE"
+
+    if SPECIAL in command_str:
+        logging.info("🔎 Detected DATEFLE job — running it first.")
+        # Split on semicolons or newlines, strip blanks
+        parts = [p.strip() for p in re.split(r"[;\n]+", command_str) if p.strip()]
+        # Pull out the DATEFLE command
+        datefle_cmd = next(p for p in parts if SPECIAL in p)
+        remaining = "; ".join(p for p in parts if p != datefle_cmd)
+
+        # Run DATEFLE first
+        send_and_wait(datefle_cmd)
+
+        # Then the rest (if any)
+        if remaining:
+            logging.info("▶ Running remaining commands.")
+            send_and_wait(remaining)
+        else:
+            logging.info("✅ No other commands to run after DATEFLE.")
+
+    else:
+        logging.info("▶ No DATEFLE job found — running all commands together.")
+        send_and_wait(command_str)
+
+
+# -----------------------------------------------------------------------------
+# MAIN GUARD
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Example: replace this with your actual multi-command string
+    all_cmds = """
+      sudo -H -u eisladmin bash -c 'source /mnt/ingestion/autosys/es1.env;
+      sendevent -E STARTJOB -J WMALESL_5481_DEV_DMSH_PRCSSNG_LSPT0100;
+      WMALESL_5481_DEV_DMSH_PROSSNG_DATEFLE --option xyz;
+      sendevent -E CHANGE_STATUS -S FAILURE -J WMALESL_5481_DEV_DMSH_PRCSSNG_MNF1200;
+      sendevent -E STARTJOB -J WMALESL_5481_DEV_DMSH_PRCSSNG_PDBT931Z;
+      '
+    """
+    try:
+        execute_commands(all_cmds)
+    except Exception as e:
+        logging.error(f"❌ Execution failed: {e}")
+        raise
+
+
+
+
+
 import re
 
 # … your existing imports, getToken(), variables, etc. …
