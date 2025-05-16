@@ -1,234 +1,387 @@
-Great. I’ll prepare a complete walkthrough for setting up a Retrieval-Augmented Generation (RAG) pipeline using OpenAI and LangChain, with your attribute embeddings stored in pgvector. It will include:
+Thank you! I’ll now prepare a finalized Python script that:
 
-* How to load your enriched JSON or CSV into LangChain
-* How to connect to pgvector as a vector store
-* How to index and retrieve embedded attributes
-* How to build a retriever and chain it with OpenAI’s language models for answering questions
+1. Processes all JSON files in a folder, where each file is a JSON array of records.
+2. Embeds each attribute individually, using OpenAI's text-embedding-3-small model.
+3. Handles long attribute definitions with chunking and averages their embeddings.
+4. Writes enriched JSON back into the same folder with `_enriched.json` suffix.
+5. Appends all attribute-level embedding data into a single CSV file in the same folder.
 
-I’ll let you know once it’s ready.
+It will also include exponential backoff logic to handle API rate limits. I’ll let you know once it’s ready.
 
 
-# Implementing a Retrieval-Augmented Generation (RAG) Pipeline with LangChain, OpenAI, and pgvector
+# Python Script for Embedding Data Model Attributes
 
-**Retrieval-Augmented Generation (RAG)** is a technique where an LLM is supplemented with external knowledge retrieved from a vector database, ensuring answers are grounded in the provided context. Instead of relying solely on the model's parameters, relevant information is fetched (using semantic similarity search) and fed into the prompt, giving the model the best chance to generate an accurate response. In our case, the external knowledge consists of data model attribute descriptions (e.g., "Customer Credit Limit") that have been embedded as high-dimensional vectors via OpenAI’s `text-embedding-3-small` model. The pgvector extension for PostgreSQL will serve as our vector store, allowing us to perform similarity search on these embeddings directly within Postgres. By combining pgvector with LangChain’s framework, we can easily orchestrate the embedding retrieval and LLM query steps – unlocking a powerful RAG pipeline for semantic queries over database attributes.
+**Goal:** We will create a Python script that reads JSON files describing data models (with entities and attributes), generates vector **embeddings** for each attribute using OpenAI’s `text-embedding-3-small` model, and outputs enriched JSON files and a consolidated CSV. An *embedding* is essentially a numerical vector representation of text that captures its semantic meaning. By embedding each attribute’s name and definition, we can transform textual definitions into vectors for tasks like semantic search or clustering.
 
-**Tech Stack Overview:**
+Below we outline the steps, provide explanations, and present the complete script. The script will:
 
-* **LangChain** – Orchestrates the chain of retrieval and generation (providing `VectorStore` integration, `Retriever` abstraction, and `RetrievalQA` chain).
-* **OpenAI Embeddings & LLM** – Generates vector embeddings for text (using OpenAI’s models) and answers questions (using GPT-3.5 Turbo / GPT-4 via OpenAI API).
-* **PostgreSQL + pgvector** – Stores embeddings in a `VECTOR` column and enables efficient similarity search in SQL. Our pgvector table already contains embedded representations (1536-dimensional vectors) of each attribute's description or metadata, along with fields identifying the attribute (model, entity, table, column, etc.).
+* **Scan a folder for JSON files** (each containing a list of data model records).
+* **Parse each JSON file** and iterate through each record’s attributes.
+* **Prepare text for embedding** by combining each attribute’s name and definition. Handle cases where the text is very long by **chunking** it.
+* **Generate an embedding vector** for each attribute using OpenAI’s API (model `text-embedding-3-small`), with automatic **exponential backoff** to handle rate limits.
+* **Attach the embedding** (a list of floats) to the attribute data and write out a new enriched JSON file (with a `_enriched.json` suffix).
+* **Collect all attributes into a CSV file** with columns for model, table, entity, attribute, etc., including the embedding as a JSON string in one column.
 
-Below, we walk through setting up the RAG pipeline step by step, including Python code snippets and explanations for each component of the system.
+We will ensure the solution handles OpenAI API token limits by chunking long text inputs (the model has a limit of 8191 tokens), and be mindful of irregular JSON field names (like keys containing spaces or punctuation).
 
-## 1. Setting Up the PGVector Database Connection
+## Scanning the Folder for JSON Files
 
-First, ensure you have a PostgreSQL database with the **pgvector** extension enabled (e.g., `CREATE EXTENSION vector;`). The pgvector extension allows Postgres to store vector embeddings and run nearest-neighbor searches on them. In our scenario, we assume a table already exists (or will be created) to hold embeddings for data model attributes. This table (say, `attribute_embeddings`) has a `VECTOR(1536)` column for the embedding (since OpenAI’s `text-embedding-3-small` produces 1536-dimensional vectors) and additional columns for metadata like `model_name`, `entity_name`, `table_name`, `attribute_name`, etc., as described.
-
-Next, install the necessary Python packages (if not already installed):
-
-```bash
-pip install langchain langchain_postgres langchain_openai psycopg[binary]
-```
-
-The `langchain_postgres` package provides the `PGVector` vector store integration, and `langchain_openai` provides easy access to OpenAI’s models. You'll also need to set your OpenAI API key (e.g., via the `OPENAI_API_KEY` environment variable or using `os.environ` in code).
-
-Now, let's connect to the PostgreSQL database using LangChain’s PGVector integration:
+First, the script needs to locate all JSON files in a specified directory. We can use Python’s built-in libraries to achieve this. One convenient way is using the `glob` module to match all `*.json` files in the folder:
 
 ```python
 import os
-from langchain_postgres import PGVector
-from langchain_openai import OpenAIEmbeddings
+from glob import glob
 
-# Set OpenAI API key (assuming it's stored in an environment variable)
-os.environ["OPENAI_API_KEY"] = "<YOUR_OPENAI_API_KEY>"
-
-# Initialize the OpenAI embedding model (text-embedding-3-small)
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-# Define Postgres connection details and collection name
-connection_str = "postgresql+psycopg://<USER>:<PASSWORD>@<HOST>:<PORT>/<DBNAME>"
-collection_name = "attribute_collection"  # name for our vector collection
-
-# Connect to (or create) the PGVector vector store
-vector_store = PGVector(
-    embeddings=embeddings,
-    collection_name=collection_name,
-    connection=connection_str,
-    embedding_length=1536,  # specify dimensionality of embeddings
-    use_jsonb=True          # store metadata in a JSONB column
-)
+folder_path = "/path/to/json/folder"
+json_files = glob(os.path.join(folder_path, "*.json"))
 ```
 
-In the above code:
+In this snippet, `glob(os.path.join(folder_path, "*.json"))` returns a list of all filenames ending with `.json` in the given folder. We could also use `os.listdir` and filter for `.json` extension, but `glob` handles patterns and is straightforward for this use case.
 
-* We create an `OpenAIEmbeddings` instance for the same model that was used to embed our data (ensuring compatibility). The `text-embedding-3-small` model returns 1536-dimensional vectors.
-* We supply a Postgres connection string (using the `psycopg` driver as required by `langchain_postgres`) and a `collection_name`. **Note:** The `collection_name` is **not** the literal table name, but an identifier used by LangChain; it will create underlying tables if they don't exist.
-* We pass `embedding_length=1536` so that PGVector knows the vector size (this is optional but needed to build an index; without it, the vector column can’t be indexed properly). We also set `use_jsonb=True` to store metadata fields (like attribute names, table names, etc.) in a JSONB column for flexibility.
+*Handling no files:* If `json_files` comes up empty (no JSON files found), the script can simply end or print a message. In our script, we will proceed only if there are files to process.
 
-Once this runs, `vector_store` is a LangChain vector store object backed by our Postgres/pgvector table. If the collection tables did not exist, they will be created at this point (ensure your DB user has permission to create tables). If the tables already exist (because we previously inserted embeddings), the code will reuse them without reinitializing (since we did not set `pre_delete_collection=True` by default).
+## Reading JSON Data Model Files
 
-## 2. Loading Precomputed Embeddings and Metadata
-
-Since our data model attributes were already embedded and saved (e.g., from JSON/CSV), we need to load these into the vector store. There are two scenarios:
-
-1. **Use existing PG data:** If you have already inserted the embeddings into the pgvector table (via a prior script or ETL process), the `PGVector` initialization above can utilize them directly. We could also explicitly connect to an existing index using `PGVector.from_existing_index(...)` to ensure no new data is added. For example:
-
-   ```python
-   vector_store = PGVector.from_existing_index(
-       embedding=embeddings,
-       collection_name=collection_name,
-       connection=connection_str
-   )
-   ```
-
-   This will load the existing vector collection without trying to reinsert documents (it assumes the table for `collection_name` is already populated).
-
-2. **Load from JSON/CSV:** If you have the embeddings and metadata in files and need to insert them, you can read those files and add to the vector store. For instance, if `attributes.csv` contains columns for `model_name, entity_name, attribute_name, ...` and a serialized vector, you could do:
-
-   ```python
-   import pandas as pd
-   from langchain_core.documents import Document
-
-   df = pd.read_csv("attributes.csv")
-   docs = []
-   for _, row in df.iterrows():
-       # Construct a text description for the attribute as the content
-       content = f"{row['attribute_name']} - {row['table_name']} ({row['column_data_type']})"
-       metadata = {
-           "model_name": row["model_name"],
-           "entity_name": row["entity_name"],
-           "table_name": row["table_name"],
-           "attribute_name": row["attribute_name"],
-           "column_name": row["column_name"],
-           "column_data_type": row["column_data_type"],
-           "pk": row["pk"]
-       }
-       docs.append(Document(page_content=content, metadata=metadata))
-   # Add documents with their embeddings (assuming embeddings are precomputed or will be computed)
-   vector_store.add_documents(documents=docs)
-   ```
-
-   In practice, if the embeddings are precomputed and available (e.g., as a list of floats in the CSV/JSON), you might use `PGVector.from_embeddings()` to bulk insert without re-generating embeddings. The above example illustrates creating `Document` objects with metadata and adding them, letting LangChain handle embedding each `page_content` via the OpenAI model. The `page_content` could be a descriptive sentence of the attribute or just the attribute name; and we store the identifying fields in `metadata` (these will be saved as JSONB in the vector store).
-
-After this step, our `vector_store` contains all attribute embeddings along with their metadata. Each entry in the vector store corresponds to one attribute (one row from the table) and knows, for example, its attribute name and which table/entity it belongs to. We are now ready to query this store semantically.
-
-## 3. Configuring a Semantic Search Retriever
-
-With the vector store ready, we create a **retriever**. A retriever is an interface that, given a user query (text), will return the most relevant documents (in our case, attribute entries) from the vector store. LangChain makes this easy: we can call `vector_store.as_retriever()` to get a retriever object tied to our data. We also specify how many results (`k`) to fetch and any other search parameters. For example:
+For each JSON file found, we will read its content using Python’s `json` module. Each file is expected to be a JSON **array** of records. We’ll parse it into a Python list of dictionaries:
 
 ```python
-retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+import json
+
+for file_path in json_files:
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data_records = json.load(f)  # Parse the JSON array into a Python list
+    # Now data_records is a list of dicts, each representing a data model record
 ```
 
-This configures the retriever to return the top-5 most similar attribute entries for a given query (by default, similarity is measured via cosine distance on the embeddings). Under the hood, when we use the retriever, LangChain will:
+We use `encoding='utf-8'` to safely handle any special characters in the JSON files. Each `data_records` list item is a dictionary with keys like `"Model"`, `"Entity"`, `"TABLE NAME"`, `"ENTITY NAME"`, `"DEFINITION"`, and an `"Attributes"` list. For example, a single record might look like:
 
-1. Take the input query (e.g., *"Which attributes define customer credit limits?"*).
-2. Embed the query text into a 1536-D vector using the same OpenAI model.
-3. Perform a similarity search in the PGVector store to find the nearest stored embeddings (i.e. the most semantically similar attribute descriptions).
+```json
+{
+  "Model": "Sales",
+  "Entity": 1,
+  "TABLE NAME": "Customers",
+  "ENTITY NAME": "Customer",
+  "DEFINITION": "Contains customer master data.",
+  "Attributes": [
+    {
+      "NAME": "Customer ID",
+      "DEFINITION": "Unique identifier for a customer.",
+      "Column Name": "CUST_ID",
+      "Column Data Type": "INTEGER",
+      "PK?": "Y"
+    },
+    {
+      "NAME": "Customer Name",
+      "DEFINITION": "Full name of the customer.",
+      "Column Name": "FULL_NAME",
+      "Column Data Type": "VARCHAR",
+      "PK?": "N"
+    },
+    ...
+  ]
+}
+```
 
-**Semantic vs. Keyword Search:** Because we're using embeddings, the search can match concepts even if keywords differ. For example, a keyword search for "credit limit" might miss an attribute described as "maximum credit allowed", but a vector-based search will find it due to semantic similarity. This means the retriever can identify relevant attributes even if the question’s phrasing doesn't exactly match the column names.
+Our script will iterate through each record in `data_records` and then through each attribute in the record’s `"Attributes"` list. We’ll construct an embedding for each attribute as described next.
 
-We can further refine retrieval:
+## Preparing Attribute Text for Embedding
 
-* **Max Marginal Relevance (MMR):** To diversify results, you can use `search_type="mmr"` in `as_retriever`. This enables Max Marginal Relevance, which returns results that are relevant **and** mutually diverse. For instance:
-
-  ```python
-  retriever = vector_store.as_retriever(
-      search_type="mmr",
-      search_kwargs={"k": 5, "lambda_mult": 0.5}
-  )
-  ```
-
-  The `lambda_mult` parameter adjusts the diversity vs. relevance trade-off. An MMR retriever will ensure the fetched attributes cover different facets, which can be useful if many attributes have similar content.
-* **Metadata Filters:** If we want to restrict the search to certain criteria (e.g. only attributes from the "Customer" entity), we can apply a metadata filter. For example:
-
-  ```python
-  retriever = vector_store.as_retriever(
-      search_kwargs={
-          "k": 5,
-          "filter": {"entity_name": "Customer"}
-      }
-  )
-  ```
-
-  This filter ensures only documents whose metadata field `entity_name` is "Customer" will be considered in the similarity search. LangChain's PGVector retriever supports such filtering on the stored metadata (metadata was stored in JSONB when we added the documents).
-
-At this point, we have a `retriever` that can fetch the most relevant attribute entry (or entries) for any natural language query. Next, we’ll use this retriever in a QA chain with an LLM to generate answers.
-
-## 4. Building the RetrievalQA Chain with OpenAI LLM
-
-With our retriever in hand, we can construct a **RetrievalQA** chain. This LangChain chain will take a user question, use the retriever to get relevant context, and then prompt an LLM (OpenAI GPT model) to generate an answer using that context.
-
-We'll use OpenAI's chat model for the answer generation. For example, let's choose GPT-3.5 Turbo via LangChain's `ChatOpenAI` interface:
+For each attribute, we need to create the text that will be sent to the embedding model. The problem statement suggests using the **attribute name + definition** as the text. We should concatenate these in a clear way, for instance:
 
 ```python
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-
-# Initialize the OpenAI chat model (e.g., GPT-3.5 Turbo)
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-
-# Create the RetrievalQA chain
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",     # "Stuff" the retrieved docs into the prompt
-    retriever=retriever
-)
+text_to_embed = f"{attr.get('NAME', '')}: {attr.get('DEFINITION', '')}"
 ```
 
-Here, `chain_type="stuff"` means that the chain will simply insert the retrieved documents (our attribute descriptions) into the prompt for the LLM, usually appending them after the user’s question. This is a straightforward approach: the LLM sees the raw text of the top retrieved entries and uses them to formulate its answer. The assumption is that the combined length of the question plus the retrieved text stays within the model's context window. If we had a lot of or very large documents, we might need more sophisticated chain types (like `"map_reduce"` or `"refine"`) to summarize or iterate over pieces of context, but for concise attribute definitions, "stuff" is ideal.
+Here we use `attr.get('NAME', '')` and `attr.get('DEFINITION', '')` to safely retrieve the values (using empty string if the key is missing). We include a colon and space between the name and definition for readability, but the exact format isn't crucial as long as both pieces are present.
 
-We set `temperature=0` for the LLM to make its output deterministic and focused (important for Q\&A tasks where accuracy is key). You could also use `OpenAI()` from `langchain.llms` for a standard completion model, but `ChatOpenAI` with GPT-3.5 or GPT-4 is recommended for chat-based Q\&A scenarios.
+**Handling irregular fields:** We use `.get()` in case some attribute entries don’t have the expected keys or use slightly different key names. The structure given uses `"NAME"` and `"DEFINITION"`, which we assume are consistent. If keys like `"Column Name"` or others have spaces, using `attr.get('Column Name')` is fine (key names in dictionaries can have spaces and punctuation). Our script will be careful to use the correct keys as provided. If a certain field like `"PK?"` is missing in an attribute, we might default it to something (e.g., `False` or `N`), but in the CSV we will just write whatever is present (or empty string).
 
-At this stage, our RAG pipeline is ready: the `qa_chain` will handle taking a user query, retrieving relevant attribute info via the retriever, and then generating an answer with the OpenAI model.
+## Handling Long Text: Chunking and Averaging Embeddings
 
-## 5. Running a Sample Query
+OpenAI embedding models have a maximum context length (input size) measured in tokens. The `text-embedding-3-small` model can handle up to **8191 tokens** in the input. (8191 tokens roughly corresponds to \~6,000 English words or about 24k characters, depending on the text.) If an attribute’s name + definition combined is very large, we cannot embed it in one go. The instructions suggest using a threshold of \~2000 characters as a precaution.
 
-Let's test the pipeline with a sample question. Suppose we ask: **"Which attributes define customer credit limits?"**. We will use our `qa_chain` to answer this:
+To be safe, our script will **split the text into chunks** if it exceeds a certain length (e.g. 2,000 characters). Each chunk will then be embedded separately, and the resulting vectors will be combined by averaging. This approach is recommended by OpenAI for long inputs: break the input into manageable chunks, embed each chunk, then either use all chunk embeddings or combine them (for example, by averaging, possibly weighted by chunk size).
+
+**Chunking strategy:** We will implement a simple character-based chunking for simplicity. For example, we can split the text every N characters (N \~ 1500 or 2000 to stay under token limits with a margin). We will try to split on sentence boundaries or spaces if possible to avoid breaking words. A simple approach is:
 
 ```python
-query = "Which attributes define customer credit limits?"
-result = qa_chain.run(query)
-print(result)
+MAX_CHARS = 2000
+text = text_to_embed
+if len(text) > MAX_CHARS:
+    chunks = []
+    # Split by sentences or paragraphs if possible
+    sentences = text.split('. ')
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 2 <= MAX_CHARS:  # +2 for the period and space
+            current_chunk += sentence + '. '
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence + '. '
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+else:
+    chunks = [text]
 ```
 
-When this is executed, the chain will:
+This logic tries to accumulate sentences (separated by ". ") into chunks not exceeding the `MAX_CHARS` limit. If the text is still extremely large even after sentence splitting, one could fallback to splitting by characters. The end result is a list of one or more text chunks.
 
-* **Embed the query** and perform a similarity search in the PGVector store.
-* **Retrieve** one or more entries such as the *Credit Limit* attribute of the **Customer** entity (and any related attributes that mention credit limits).
-* **Pass** the text of those attribute entries into the GPT model, along with the question.
-* The **LLM generates** an answer using the provided context.
+**Averaging embeddings:** Once we have multiple chunks, we request an embedding for each chunk. We then compute the *average* of the embedding vectors. A simple average treats each chunk equally, but note that longer chunks contain more information. A more precise method is to do a **weighted average by chunk length** (e.g., weighting by number of tokens in each chunk). For simplicity, we might use an unweighted average (each chunk contributes equally) unless the chunks vary drastically in length. Averaging means summing up the vectors element-wise and dividing by the number of vectors. This yields a single embedding of the same dimension that represents the full text.
 
-For example, if our data model had an attribute **Customer.CreditLimit** (with a description like "Maximum credit amount allowed for the customer"), the output might be:
+*Note:* The OpenAI Cookbook demonstrates weighting by token count and even normalizing the final vector to unit length. These steps can improve the embedding representation for combined chunks, but we will stick to the basic average as requested.
 
-> *"The Customer entity includes a **CreditLimit** attribute, which defines the maximum amount of credit that can be extended to a customer. This attribute effectively sets each customer’s credit limit in the system."*
+## Generating Embeddings with OpenAI’s API
 
-This answer was generated by the model, but it’s grounded in the retrieved data – specifically, the presence of a "CreditLimit" attribute in the Customer table metadata. The retrieval-augmented approach ensures the model only states what the data provides (in this case, identifying the relevant attribute and its meaning), rather than relying on its own potentially inaccurate prior knowledge.
+Once we have the text (or text chunks) for an attribute, we use OpenAI’s API to get the embedding vector. We will use the `openai` Python library (make sure to install it via `pip install openai` and set your API key). The model specified is `"text-embedding-3-small"`, which produces a 1536-dimensional vector for each text input. This model is part of OpenAI’s third-generation embedding models, offering improved accuracy at a lower cost than the older `text-embedding-ada-002`.
 
-You can modify the query and expect the pipeline to return relevant attribute information. For instance, a query like *"What is the primary key of the Customer table?"* would cause the retriever to find whichever attribute is marked as the primary key (`pk`) for the Customer entity in the metadata, and the LLM’s answer would incorporate that detail (e.g. "*The Customer table’s primary key is the **CustomerID** attribute*").
+A basic call to get an embedding for a piece of text looks like this:
 
-## 6. Enhancing Retrieval with Chunking and Metadata
+```python
+import openai
+# Make sure your OpenAI API key is set, e.g., via openai.api_key = "sk-...".
 
-Our basic RAG pipeline is functional, but there are additional enhancements and best practices to consider:
+response = openai.Embedding.create(input=text_to_embed, model="text-embedding-3-small")
+vector = response['data'][0]['embedding']  # this is the list of float values
+```
 
-* **Chunking Long Documents:** If any attribute descriptions or documentation were very large, it would be wise to split them into smaller chunks before embedding. LangChain provides utilities like `TextSplitter` to break text into chunks of a specified token length. By chunking, each piece of text stays within the model’s context window and retrieval can return just the relevant chunk. In our attribute use-case, descriptions are likely short, so this isn't a concern. But for other RAG scenarios (e.g. processing lengthy policies or manuals), chunking is essential to avoid truncation and to improve focus.
-* **Metadata-Guided Answers:** We demonstrated simple metadata filtering for retrieval. You can also use metadata in the prompt to guide the LLM’s answer. For example, you might store a source or `origin` for each attribute (like which data model or revision it came from) and then modify the `RetrievalQA` prompt template so that the LLM includes that source in its response. This can help provide provenance for the answers. LangChain’s chains are customizable with prompt templates, enabling you to inject such instructions or formatting (e.g., *"Include the table name for each attribute in the answer"*).
-* **Indexing and Performance:** For production use with many vectors, ensure you create an index on the vector column in Postgres for efficient similarity search. Pgvector supports multiple index types (like HNSW and IVFFlat) for approximate nearest neighbors. Creating an index (e.g. using HNSW for cosine distance) will significantly speed up retrieval on large datasets. In SQL, for example:
+OpenAI allows sending a **list of texts** in one API call as well (`input` can be a list of strings). For example, `openai.Embedding.create(input=[text1, text2], model="text-embedding-3-small")` would return two embeddings. In our case, when we have multiple chunks, we could send the list of chunks in one go to get all chunk embeddings in one API call. For clarity, we might embed one chunk at a time, but batching is an option to reduce API calls.
 
-  ```sql
-  CREATE INDEX ON attribute_embeddings USING hnsw (embedding vector_cosine_ops);
-  ```
+**Handling API credentials:** The script should retrieve the API key securely. Typically, you would set `openai.api_key = <your key>` in the code, or better, set the environment variable `OPENAI_API_KEY` and have `openai.api_key = os.getenv("OPENAI_API_KEY")`. In production, avoid hardcoding the API key in the script.
 
-  This step isn't handled by LangChain itself, but it’s important to do in Postgres for scalability. After creating an index, pgvector will use it to answer similarity queries much faster, especially as your number of attributes grows.
-* **Alternate Distance Metrics:** By default, LangChain’s PGVector uses cosine similarity (which is a good choice for text embeddings). If your use-case prefers a different distance metric (pgvector also supports L2, inner product, etc.), you can specify that via the `distance_strategy` parameter when initializing the vector store. Ensure the index you create matches the distance metric (e.g., use `vector_l2_ops` for L2 distance).
+## Implementing Exponential Backoff with Tenacity
 
-By implementing these enhancements as needed, you can improve the accuracy and efficiency of your RAG system. The end result is a robust pipeline where an OpenAI LLM can answer questions about your **data model** by leveraging the semantic knowledge encoded in pgvector – providing precise, context-aware answers that would be hard to get with simple keyword search alone.
+When calling the OpenAI API repeatedly (potentially thousands of times, one per attribute), we risk hitting rate limits (HTTP 429 Too Many Requests errors). To make our script robust, we will implement **automatic retries with exponential backoff** for the embedding calls. This means if a request is rate-limited or encounters a transient error, the script will wait for an increasing delay before retrying, rather than failing immediately. The [`tenacity`](https://pypi.org/project/tenacity/) library provides a convenient decorator for this purpose.
+
+We will use `tenacity.retry` with `wait_random_exponential(min=1, max=60)` and `stop_after_attempt(6)`. This configuration will retry up to 6 times, waiting with exponential backoff starting at 1 second and capping at 60 seconds between retries. We will instruct it to retry on specific exceptions (like `openai.error.RateLimitError` or other transient OpenAI API errors). For example:
+
+```python
+import tenacity
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
+from openai.error import RateLimitError, APIError, Timeout, APIConnectionError
+
+# Decorator for exponential backoff on OpenAI API rate limits and transient errors
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6),
+       retry=retry_if_exception_type((RateLimitError, APIError, Timeout, APIConnectionError)))
+def get_embedding_with_backoff(text, model="text-embedding-3-small"):
+    response = openai.Embedding.create(input=text, model=model)
+    return response['data'][0]['embedding']
+```
+
+In this function `get_embedding_with_backoff`, any call that raises one of the specified exceptions will trigger a retry after a delay. The delay increases exponentially (with some jitter/randomness) between attempts. After 6 failed attempts, it will give up. We exclude `openai.error.InvalidRequestError` (which is raised for irrecoverable issues like exceeding context length or invalid input) so that those are not retried unnecessarily.
+
+We will use this helper function whenever we call the OpenAI API to embed text. This ensures our script is resilient to temporary rate limits or network issues.
+
+## Writing the Enriched JSON Output
+
+After embedding all attributes in a record, we will have added an `"embedding"` field (list of floats) to each attribute dictionary. We then save the modified records back to a new JSON file. The new filename can be the original name with `_enriched.json` appended before the extension. For example, if the original file was `data_models.json`, the output could be `data_models_enriched.json` in the same folder.
+
+We can use `json.dump` to write the Python object back to a JSON file. It’s good practice to specify `ensure_ascii=False` and an indentation for readability:
+
+```python
+output_path = file_path.replace(".json", "_enriched.json")
+with open(output_path, 'w', encoding='utf-8') as f:
+    json.dump(data_records, f, ensure_ascii=False, indent=4)
+```
+
+This will create a nicely formatted JSON file with UTF-8 encoding, preserving any non-ASCII characters properly. Each record in this JSON will be identical to the input, except every attribute now has an `"embedding"` field containing the list of floats.
+
+**File size note:** Embeddings are 1536-dimensional by default for this model, so each attribute’s embedding will be a list of 1536 numbers. This will increase the size of the JSON files. If a JSON file had N attributes total (across all records), it will gain N \* 1536 float numbers. This is something to be aware of in terms of file size and memory usage.
+
+## Creating a Combined CSV of All Attributes
+
+Finally, we also write a CSV file summarizing all attributes across all JSON files. Each **row** in the CSV will represent one attribute, with the following columns:
+
+* `model_name` – the model name (from the record’s `"Model"` field)
+* `table_name` – the table name (from `"TABLE NAME"` field)
+* `entity_name` – the entity name (from `"ENTITY NAME"` field)
+* `attribute_name` – the attribute’s name (from attribute `"NAME"` field)
+* `column_name` – the physical column name (from `"Column Name"` field)
+* `column_data_type` – data type of the column (from `"Column Data Type"`)
+* `pk` – primary key indicator (from `"PK?"` field, e.g., `Y` or `N`)
+* `embedding` – the embedding vector as a JSON string
+
+We will open a CSV file (let’s call it `attributes_enriched.csv` in the same folder) and write a header row followed by one row per attribute. Using Python’s built-in `csv` module, it’s important to open the file with `newline=''` to avoid blank lines on some systems. For example:
+
+```python
+import csv
+
+csv_path = os.path.join(folder_path, "attributes_enriched.csv")
+with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+    writer = csv.writer(csvfile)
+    # Write header:
+    writer.writerow(["model_name", "table_name", "entity_name", "attribute_name",
+                     "column_name", "column_data_type", "pk", "embedding"])
+    # Write data rows:
+    for record in all_records:             # we will accumulate all records from all files
+        for attr in record["Attributes"]:
+            embedding_json = json.dumps(attr.get("embedding", []))
+            writer.writerow([
+                record.get("Model", ""), 
+                record.get("TABLE NAME", ""), 
+                record.get("ENTITY NAME", ""), 
+                attr.get("NAME", ""), 
+                attr.get("Column Name", ""), 
+                attr.get("Column Data Type", ""), 
+                attr.get("PK?", ""), 
+                embedding_json
+            ])
+```
+
+Here we convert the embedding list to a JSON string (`json.dumps`) before writing, so that the entire list of floats appears as a single field in the CSV (enclosed in quotes). This prevents commas in the embedding from creating extra columns. The CSV will thus have an embedding column that contains a JSON array of numbers as text.
+
+We iterate through all records and their attributes. We can gather all records from all files into a single list `all_records` for convenience, or write to CSV inside the loop as we go. Either approach works as long as we ensure the header is written once.
+
+## Full Python Script
+
+Below is the **complete script** incorporating all the above steps. You can adjust the `folder_path` to point to your folder containing the JSON files. Ensure you have installed the `openai` and `tenacity` packages and set your OpenAI API key before running.
+
+```python
+import os, json, csv
+import openai
+from glob import glob
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
+from openai.error import RateLimitError, APIError, Timeout, APIConnectionError, InvalidRequestError
+
+# Configuration
+folder_path = "/path/to/json/folder"          # TODO: set this to your directory path
+output_csv = os.path.join(folder_path, "attributes_enriched.csv")
+MAX_CHARS = 2000                              # max characters before chunking text
+openai.api_key = os.getenv("OPENAI_API_KEY")  # or set your API key directly
+
+# Prepare CSV writer
+csvfile = open(output_csv, 'w', newline='', encoding='utf-8')
+writer = csv.writer(csvfile)
+writer.writerow(["model_name", "table_name", "entity_name", "attribute_name",
+                 "column_name", "column_data_type", "pk", "embedding"])
+
+# Tenacity retry decorator for OpenAI API calls (exponential backoff on certain errors)
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6),
+       retry=retry_if_exception_type((RateLimitError, APIError, Timeout, APIConnectionError)))
+def get_embedding_with_backoff(text, model="text-embedding-3-small"):
+    """Call OpenAI API to get embedding, with retries on rate limit and transient errors."""
+    response = openai.Embedding.create(input=text, model=model)
+    return response['data'][0]['embedding']
+
+# Process each JSON file in the folder
+for file_path in glob(os.path.join(folder_path, "*.json")):  # find all JSON files:contentReference[oaicite:18]{index=18}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        try:
+            records = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Skipping {file_path}: JSON decode error: {e}")
+            continue
+
+    # Process each record in the JSON array
+    for record in records:
+        model_name = record.get("Model", "")
+        table_name = record.get("TABLE NAME", "")
+        entity_name = record.get("ENTITY NAME", "")
+        # Some records might not have 'Attributes' or it might not be a list
+        attributes = record.get("Attributes", [])
+        if not isinstance(attributes, list):
+            continue  # skip if attributes is not a list as expected
+
+        for attr in attributes:
+            # Compose text from attribute name and definition
+            name = attr.get("NAME", "") 
+            definition = attr.get("DEFINITION", "")
+            text = f"{name}: {definition}" if name or definition else ""
+            if not text:
+                # If there's no text (empty name and definition), skip embedding
+                attr["embedding"] = []
+                continue
+
+            # Chunk the text if it's too long for safety
+            chunks = []
+            if len(text) > MAX_CHARS:
+                # Split by sentence (naive approach)
+                sentences = text.split('. ')
+                current_chunk = ""
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) + 2 <= MAX_CHARS:
+                        current_chunk += sentence + '. '
+                    else:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = sentence + '. '
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+            else:
+                chunks = [text]
+
+            # Get embeddings for each chunk and average them if multiple
+            try:
+                if len(chunks) == 1:
+                    # Single chunk - directly embed
+                    embedding = get_embedding_with_backoff(chunks[0])
+                else:
+                    # Multiple chunks - embed each and then average
+                    chunk_vectors = []
+                    for chunk in chunks:
+                        vec = get_embedding_with_backoff(chunk)
+                        chunk_vectors.append(vec)
+                    # Average the vectors element-wise
+                    # (assuming all vectors are of equal length, as they should be)
+                    avg_vector = [0] * len(chunk_vectors[0])
+                    for vec in chunk_vectors:
+                        for i, val in enumerate(vec):
+                            avg_vector[i] += val
+                    avg_vector = [val / len(chunk_vectors) for val in avg_vector]
+                    embedding = avg_vector
+                attr["embedding"] = embedding
+            except InvalidRequestError as e:
+                # This can happen if input is still too long or other issues; handle gracefully
+                print(f"Embedding failed for attribute '{name}' in {file_path}: {e}")
+                attr["embedding"] = []
+            except Exception as e:
+                # Catch-all for any other errors (should be rare with tenacity)
+                print(f"Unexpected error embedding '{name}': {e}")
+                attr["embedding"] = []
+
+            # Write the attribute row to CSV
+            embedding_json = json.dumps(attr.get("embedding", []))
+            writer.writerow([
+                model_name, 
+                table_name, 
+                entity_name, 
+                name, 
+                attr.get("Column Name", ""), 
+                attr.get("Column Data Type", ""), 
+                attr.get("PK?", ""), 
+                embedding_json
+            ])
+    # Save enriched JSON for this file
+    output_path = file_path.rsplit(".", 1)[0] + "_enriched.json"
+    with open(output_path, 'w', encoding='utf-8') as out_f:
+        json.dump(records, out_f, ensure_ascii=False, indent=4)
+
+# Close the CSV file
+csvfile.close()
+```
+
+**Explanation of the script:**
+
+* We import necessary modules: `os`, `json`, `csv`, `openai`, `glob`, and `tenacity` with specific functions.
+* We set `folder_path` to the directory containing JSON files and define `output_csv` path. We also define `MAX_CHARS = 2000` for chunking threshold. The OpenAI API key is fetched from environment for security.
+* We open the CSV file for writing (`newline=''` to avoid extra blank lines) and write the header row.
+* We define `get_embedding_with_backoff` as a wrapper around `openai.Embedding.create`. The `@retry` decorator from tenacity will automatically handle retries with exponential backoff if a RateLimitError, APIError, Timeout, or APIConnectionError is raised. We stop after 6 attempts max.
+* We loop over each JSON file in the folder (using `glob` to find them). For each file, we load the JSON content into `records`.
+* For each `record` in `records`, we retrieve `model_name`, `table_name`, `entity_name`. We get the `attributes` list, and if it’s not present or not a list, we skip processing that record.
+* For each `attr` in `attributes`, we form the text to embed (concatenating name and definition). If both name and definition are empty, we skip embedding (assign an empty list).
+* If the text is longer than `MAX_CHARS`, we split it into `chunks` by sentences. The chunking logic accumulates sentences until adding another would exceed the limit, then starts a new chunk. This is a simple strategy; complex cases could use more robust methods (or token-based splitting via `tiktoken` for precision).
+* We then call `get_embedding_with_backoff` on each chunk (or the single text if no chunking was needed). The tenacity decorator will retry the API call on rate limits, helping us handle heavy loads gracefully.
+* If multiple chunk embeddings are produced, we compute an average vector. We initialize `avg_vector` with zeros of the correct length (length of the first chunk’s embedding) and add each chunk vector to it. Then divide each element by the number of chunks to get the average. This averaged vector is our representation for the full text.
+* We attach the resulting `embedding` list to the attribute dictionary (`attr["embedding"] = embedding`). In case of an OpenAI `InvalidRequestError` (e.g., text still too long or other issues like malformed input), we catch it and set the embedding to an empty list, logging the error. We also catch any other exception to avoid crashing the script if something unexpected happens for a particular attribute.
+* We write a row to the CSV for this attribute, converting the embedding list to a JSON string so it stays as one field.
+* After processing all attributes of all records in a file, we dump the modified `records` list to a new JSON file with `_enriched.json` suffix. We use `ensure_ascii=False, indent=4` for pretty printing in UTF-8.
+* Finally, we close the CSV file to ensure all data is flushed to disk.
+
+## Conclusion
+
+This script automates the embedding of data model attributes and compiles results into both JSON and CSV formats. By using OpenAI’s efficient embedding model and handling lengthy text and rate limits carefully, it ensures compatibility with API constraints (token limits and rate limits). The use of tenacity for retries and text chunking for long inputs makes the process robust. You can now run this script on your dataset to obtain embeddings for each attribute, facilitating advanced analysis like semantic search or clustering on the definitions of your data model fields.
 
 **Sources:**
 
-1. Bugbytes.io – *Retrieval Augmented Generation with LangChain and PGVector*: Explanation of RAG and LangChain usage.
-2. Rahul Mydur (Medium) – *PGVector: Integrating PostgreSQL with LangChain for Semantic Search*: Overview of pgvector and semantic search advantages.
-3. LangChain Documentation – *PGVector Vector Store Integration*: Code examples for connecting and querying PGVector.
-4. OpenAI Blog – *New Embedding Models (2024)*: Introduction of `text-embedding-3-small` (1536-dimension embeddings).
-5. PostgreSQL (pgvector) Documentation: Neon Tech – *pgvector extension*: Storing embeddings and performing similarity search in Postgres.
-6. EDB Blog – *What is pgvector?* (Gulcin Yildirim): pgvector usage and indexing example (HNSW index creation).
+* OpenAI API – *New embedding models and API updates*
+* OpenAI Cookbook – *Embedding long inputs and handling chunking*
+* OpenAI Cookbook – *Using embeddings with tenacity backoff*
+* Python Docs/StackOverflow – JSON and CSV handling
