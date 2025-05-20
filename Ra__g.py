@@ -1,3 +1,243 @@
+Thanks! I’ll now create a Databricks-compatible RAG pipeline using LangChain, OpenAI, and Chroma (instead of FAISS), that loads precomputed JSON embeddings from DBFS. The script will:
+
+* Install only allowed packages (compatible with private repo or standard PyPI)
+* Load pre-embedded JSON from DBFS
+* Use Chroma in-memory as the vector store
+* Use LangChain’s RetrievalQA with OpenAI’s GPT model
+* Output answers and metadata into a pandas DataFrame for analysis
+
+I’ll let you know once the notebook-style script is ready.
+
+
+```python
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Retrieval-Augmented Generation (RAG) Pipeline on Databricks
+# MAGIC *Note: This script uses Databricks notebook source format (`# MAGIC` for markdown, `# COMMAND ----------` to separate cells):contentReference[oaicite:0]{index=0}.*
+# MAGIC 
+# MAGIC This notebook demonstrates a Retrieval-Augmented Generation pipeline using **LangChain**, **OpenAI** GPT-3.5/4, and **Chroma** for vector storage. We will:
+# MAGIC - Install essential libraries (LangChain, OpenAI, Chroma, etc.) with minimal dependencies (no FAISS).
+# MAGIC - Load enriched JSON files from **DBFS** (Databricks File System) containing precomputed 1536-dimensional attribute embeddings:contentReference[oaicite:1]{index=1}.
+# MAGIC - Build an in-memory **Chroma** vector index from these embeddings (avoiding recomputation).
+# MAGIC - Use **LangChain**'s RetrievalQA chain with an OpenAI Chat model to answer questions, retrieving relevant context via semantic search:contentReference[oaicite:2]{index=2}.
+# MAGIC - Store the results in a pandas DataFrame with columns: *query*, *answer*, *top_match_attribute*, *entity_name*, *table_name*, *score*.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1. Install and Import Required Libraries
+# MAGIC We install the necessary packages using pip. Only essential libraries are installed: **LangChain** (for chain logic), **OpenAI** (to call the API), **Chroma** (vector store), and **pandas** (for results). 
+# MAGIC The `%pip` magic command installs packages in the notebook environment. 
+# MAGIC *(No FAISS is used, as Chroma will serve as the vector store.)*
+
+# COMMAND ----------
+
+# MAGIC %pip install -q langchain openai chromadb pandas
+
+# COMMAND ----------
+
+# After installation, import the libraries into the Python environment
+import os, json
+import pandas as pd
+
+# Import classes from LangChain and Chroma
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+
+# Ensure OpenAI API key is available (set as environment variable or Databricks secret)
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    # You can set the API key using Databricks secrets or directly for testing:
+    # os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_API_KEY"
+    print("⚠️ OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. Load Enriched Data from DBFS
+# MAGIC Assume the enriched JSON files are stored in a DBFS directory. Each JSON file contains a list of records, each with an entity's metadata (e.g. `entity_name`, `table_name`) and a list of attributes. Each attribute has a precomputed embedding vector and possibly additional info (such as attribute name and value).
+# MAGIC 
+# MAGIC We'll load all JSON files from the specified folder into memory. Using the `dbfs:/` path allows us to access DBFS files via the local filesystem (mounted under `/dbfs`):contentReference[oaicite:3]{index=3}.
+# MAGIC 
+# MAGIC **Configuration:** Set the `data_dir` variable to the DBFS path of the folder containing the JSON files. Then we read each file and aggregate all records into a Python list.
+
+# COMMAND ----------
+
+# Define the path to the directory containing JSON files on DBFS
+data_dir = "dbfs:/path/to/json_folder"  # TODO: replace with your DBFS folder path
+
+# List all JSON files in the directory
+files_info = [f for f in dbutils.fs.ls(data_dir) if f.path.endswith(".json")]
+json_paths = [f.path for f in files_info]
+
+# Load records from all JSON files
+all_records = []
+for path in json_paths:
+    # Convert dbfs:/ paths to local /dbfs/ paths for Python I/O
+    local_path = path.replace("dbfs:/", "/dbfs/")
+    with open(local_path, "r") as f:
+        data = json.load(f)
+        # Each JSON file contains a list of records (extend the main list)
+        all_records.extend(data)
+
+print(f"Loaded {len(all_records)} records from {len(json_paths)} JSON files.")
+# (Optional) Inspect a sample record structure for verification
+if all_records:
+    sample = all_records[0]
+    print("Sample record keys:", list(sample.keys()))
+    if "attributes" in sample:
+        print("Sample has", len(sample["attributes"]), "attributes; first attribute keys:", list(sample["attributes"][0].keys()))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 3. Build Chroma Vector Store from Precomputed Embeddings
+# MAGIC Next, we create an in-memory Chroma vector store and insert all attribute embeddings. We do **not** recompute embeddings; instead, we directly use the provided 1536-dimensional vectors for each attribute:contentReference[oaicite:4]{index=4}.
+# MAGIC 
+# MAGIC For each attribute, we prepare a document text and metadata. The document text combines the entity name and attribute (and its value, if available) to give the LLM useful context, while metadata stores identifiers (entity name, table name, attribute name). We then add these to a Chroma collection using the precomputed embeddings.
+# MAGIC 
+# MAGIC *(Chroma is used as the in-memory vector database; FAISS is avoided as requested.)*
+
+# COMMAND ----------
+
+import chromadb  # Import Chroma library
+from chromadb.config import Settings
+
+# Initialize Chroma in-memory (no persistent storage on disk)
+chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
+
+# Create or get a collection for our knowledge base
+collection_name = "rag_collection"
+collection = chroma_client.get_or_create_collection(name=collection_name)
+
+# Add documents (attributes) to the Chroma collection using existing embeddings
+doc_count = 0
+for record in all_records:
+    entity = record.get("entity_name", "")
+    table = record.get("table_name", "")
+    for attr in record.get("attributes", []) or []:
+        attr_name = attr.get("name") or attr.get("attribute_name") or ""
+        embedding = attr.get("embedding")
+        if embedding is None:
+            continue  # skip if no embedding for this attribute
+        # If attribute has a value/description, include it in the text
+        attr_value = attr.get("value") or attr.get("description") or attr.get("text") or ""
+        if attr_value:
+            doc_text = f"{entity} - {attr_name}: {attr_value}"
+        else:
+            doc_text = f"{entity} - {attr_name}"
+        # Metadata for reference
+        metadata = {"entity_name": entity, "table_name": table, "attribute_name": attr_name}
+        # Generate a unique ID (e.g., combine entity and attribute)
+        doc_id = f"{entity}:{attr_name}"
+        try:
+            collection.add(documents=[doc_text], embeddings=[embedding], metadatas=[metadata], ids=[doc_id])
+            doc_count += 1
+        except Exception as e:
+            # Handle duplicate IDs or other errors gracefully
+            print(f"Warning: could not add {doc_id} to Chroma - {e}")
+
+print(f"Inserted {doc_count} documents into the Chroma vector store.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Configure LangChain RetrievalQA with OpenAI
+# MAGIC Now we set up the LangChain RetrievalQA chain. We will use OpenAI's GPT-3.5 Turbo as the LLM (via LangChain's `ChatOpenAI`) for answering questions, and attach our Chroma vector store as the retriever for relevant context.
+# MAGIC 
+# MAGIC First, instantiate the chat model with your OpenAI API key (already set earlier). Then create a LangChain `Chroma` vector store that wraps the existing Chroma collection. We use an OpenAI embedding function (same 1536-dim model) for the query embedding. Next, we obtain a retriever from this vector store (with `k=1` to retrieve the top match). 
+# MAGIC Finally, we initialize a `RetrievalQA` chain that will:
+# MAGIC 1. Embed the user question into a vector (using the same embedding model),
+# MAGIC 2. Perform a similarity search in the Chroma store to find the most relevant attribute(s),
+# MAGIC 3. Feed the retrieved context to the ChatGPT model to generate an answer:contentReference[oaicite:5]{index=5}.
+# MAGIC 
+# MAGIC *(You can increase `k` for the retriever to consider multiple context documents if needed.)*
+
+# COMMAND ----------
+
+# Initialize OpenAI Chat model (GPT-3.5-Turbo) via LangChain
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0, openai_api_key=os.getenv("OPENAI_API_KEY"))
+
+# Wrap the existing Chroma collection in a LangChain Chroma vector store
+embedding_function = OpenAIEmbeddings()  # uses OpenAI's embedding model (1536-dim)
+vectordb = Chroma(collection_name=collection_name, embedding_function=embedding_function, client=chroma_client)
+
+# Create a retriever for the vector store (fetch top 1 most similar document)
+retriever = vectordb.as_retriever(search_kwargs={"k": 1})
+
+# Create the RetrievalQA chain with the ChatOpenAI LLM and our retriever
+qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Ask Questions and Generate Answers
+# MAGIC We can now use the `qa_chain` to answer questions. Define a list of queries and iterate through them, using the chain to get answers. For each query, we also fetch the top matching attribute document and its metadata from the vector store for reporting.
+# MAGIC 
+# MAGIC You can replace the example questions below with your own. The output will be a pandas DataFrame where each row contains:
+# MAGIC - **query**: the input question,
+# MAGIC - **answer**: the answer generated by the LLM,
+# MAGIC - **top_match_attribute**: the attribute from the knowledge base that was most relevant to the query,
+# MAGIC - **entity_name**: the entity associated with that attribute,
+# MAGIC - **table_name**: the table (or source) that the entity belongs to,
+# MAGIC - **score**: the similarity score for the retrieved attribute (higher means more relevant).
+
+# COMMAND ----------
+
+# Define the list of questions to ask (example questions given; replace with real questions)
+questions = [
+    "Example Question 1?",
+    "Example Question 2?",
+    # Add more questions as needed...
+]
+
+# Retrieve answers for each question using the RetrievalQA chain
+results = []
+for q in questions:
+    # Use the chain to get an answer from the LLM
+    answer = qa_chain.run(q)
+    # Retrieve the top matched document and its similarity score for reference
+    docs_with_score = vectordb.similarity_search_with_relevance_scores(q, k=1)
+    if docs_with_score:
+        top_doc, score = docs_with_score[0]
+        meta = top_doc.metadata
+        results.append({
+            "query": q,
+            "answer": answer,
+            "top_match_attribute": meta.get("attribute_name", ""),
+            "entity_name": meta.get("entity_name", ""),
+            "table_name": meta.get("table_name", ""),
+            "score": round(score, 4)
+        })
+    else:
+        # If no document was found (just in case), record None values
+        results.append({
+            "query": q,
+            "answer": answer,
+            "top_match_attribute": None,
+            "entity_name": None,
+            "table_name": None,
+            "score": None
+        })
+
+# Create a pandas DataFrame from the results and display it
+result_df = pd.DataFrame(results)
+print("Results:")
+display(result_df)  # Databricks display for nice table view
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC *The DataFrame above shows each query alongside the answer and the source attribute info (attribute name, entity, table, and similarity score). This concludes the RAG pipeline demonstration.*
+```
+
+
+
+####################
+
+
 Great. I’ll prepare a complete walkthrough for setting up a Retrieval-Augmented Generation (RAG) pipeline using OpenAI and LangChain, with your attribute embeddings stored in pgvector. It will include:
 
 * How to load your enriched JSON or CSV into LangChain
