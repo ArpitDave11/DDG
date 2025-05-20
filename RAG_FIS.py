@@ -1,277 +1,185 @@
-Great! I’ll now create a complete Databricks-compatible notebook script using LangChain 0.3.25 and FAISS 1.1.1. It will:
+Perfect. I’ll now prepare a complete FAISS + LangChain (langchain-community) notebook that:
 
-* Load your enriched JSON with attribute embeddings
-* Build and persist a FAISS index to disk
-* Load the index back in for retrieval
-* Use LangChain’s RetrievalQA with OpenAI
-* Output results to a pandas DataFrame with query, answer, top match attribute, entity name, table name, and score
+* Loads a JSON file containing attributes and their precomputed OpenAI embeddings (text-embedding-ada-002)
+* Creates a FAISS vector store and persists it to disk
+* Reloads the FAISS index on demand
+* Converts the index into a retriever
+* Uses LangChain's RetrievalQA with OpenAI's GPT-3.5 Turbo
+* Takes a pandas DataFrame with a column called `schemas_name`, performs semantic lookup using the retriever, and generates a new column `ai_generate` with the AI-generated description for each row
 
-I’ll let you know once the full notebook is ready.
+I’ll let you know as soon as the notebook is ready.
 
 
-# Databricks Notebook: LangChain RetrievalQA with FAISS
+# Databricks Notebook: FAISS Vector Indexing and Retrieval QA with LangChain
 
-**This notebook demonstrates how to build a question-answering system using LangChain and FAISS**. We will use precomputed 1536-dimensional embeddings for entity attributes, store them in a FAISS vector index, and set up a LangChain Retrieval QA pipeline with OpenAI's GPT-3.5-Turbo as the LLM. The steps include:
+In this notebook, we demonstrate how to build and use a FAISS vector index for retrieval-augmented generation (RAG) using LangChain. We leverage precomputed text embeddings (1536-dimensional vectors from OpenAI's `text-embedding-ada-002` model) for our knowledge base, store them in a FAISS index, and use OpenAI’s GPT-3.5 Turbo to generate descriptions for given schema names. The workflow includes installing the necessary packages, loading embeddings from JSON, building/saving a FAISS index, reloading it, wrapping it with a retriever, and using a RetrievalQA chain to populate a pandas DataFrame with AI-generated descriptions.
 
-* Installing the required libraries (LangChain 0.3.25 and FAISS 1.11.0)
-* Loading a JSON file of enriched entity metadata (with attribute definitions and embeddings)
-* Building a FAISS index from the attribute embeddings and saving it to DBFS
-* Reloading the index and creating a retriever
-* Setting up an OpenAI GPT-3.5-Turbo powered `RetrievalQA` chain
-* Querying the system in natural language and returning answers with metadata (attribute name, entity name, table name, similarity score) of the top match
+## Setup: Install and Import Dependencies
 
-## Installation and Environment Setup
-
-First, install specific versions of LangChain and FAISS that are compatible with Databricks Runtime 14.3 (Python 3.10). We also install `langchain-community` to ensure FAISS integration is available. Then import necessary modules and verify the versions:
+First, install the required libraries. LangChain’s FAISS integration resides in the `langchain-community` package (with a version compatible with LangChain 0.3.25) and requires the `faiss-cpu` library. We also install `langchain-openai` for OpenAI model support (since OpenAI integrations were split into a separate package). In Databricks, you can use `%pip install` to add these to your environment. After installation, we import necessary classes and set up the OpenAI API key for GPT-3.5 Turbo (for generation):
 
 ```python
-# Install specific versions of LangChain and FAISS
-%pip install langchain==0.3.25 langchain-community==0.3.24 faiss-cpu==1.11.0
+# Install LangChain 0.3.25 and related integrations
+%pip install langchain==0.3.25 langchain-community faiss-cpu langchain-openai
 
-# After installation, import and check versions
-import langchain
-import faiss                   # FAISS library (via faiss-cpu)
-import langchain_community     # LangChain community integrations (for vectorstores)
-print(f"LangChain version: {langchain.__version__}")
-print(f"FAISS version: {faiss.__version__}")
+# After installing, import the required modules
+import faiss
+from uuid import uuid4
+import json
+import pandas as pd
+
+# LangChain core and integration classes
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+# Set up OpenAI API key (ensure this is configured with your key or Databricks secret)
+import os
+os.environ["OPENAI_API_KEY"] = "<YOUR-OPENAI-API-KEY>"
 ```
 
-*Note:* The above `%pip install` command is intended for use in a Databricks notebook cell. It will install the required packages in the notebook environment. Ensure that the LangChain version is **0.3.25** and FAISS (faiss-cpu) is **1.11.0** for compatibility with Python 3.10.
+**Note:** The OpenAI API key is required for embedding queries and generating answers. In practice, you should store this securely (e.g., using Databricks Secrets) rather than hard-coding it. The code above uses environment variable for simplicity.
 
-## Loading the JSON Entity Metadata
+## Load Precomputed Embeddings from JSON
 
-We have a JSON file containing enriched entity metadata. Each entry in this JSON represents an entity (e.g., a database table or business entity) and includes:
-
-* **Model**: The embedding model used (e.g., `"text-embedding-ada-002"`).
-* **Entity**: An object with `TABLE_NAME`, `ENTITY NAME`, and a `DEFINITION` describing the entity.
-* **Attributes**: A list of attribute objects, each with:
-
-  * `NAME` – Attribute name
-  * `DEFINITION` – Attribute definition (text description)
-  * `Column Name` – Physical column name
-  * `Column Data Type` – Data type of the column
-  * `PK?` – Whether it’s a primary key
-  * `embedding` – The precomputed 1536-d embedding vector (list of floats) for this attribute
-
-We will load this JSON file from DBFS and inspect its structure:
+Assume we have a JSON file (e.g., `embeddings.json`) containing our knowledge base: a list of entities with their attributes, where each attribute has a text description and a precomputed 1536-dimension embedding vector (from the Ada-002 model). We will load this JSON file and prepare the data for indexing. We create `Document` objects for each attribute (storing the text and any relevant metadata like entity name), and collect all embedding vectors into a list:
 
 ```python
-import json
-
-# Path to the JSON file in DBFS (update this path as needed)
-json_path = "/dbfs/FileStore/metadata/enriched_entity_metadata.json"
+# Path to the JSON file containing entities and attribute embeddings (stored on DBFS for example)
+json_path = "/dbfs/FileStore/embeddings.json"
 
 # Load the JSON data
 with open(json_path, 'r') as f:
-    entities_data = json.load(f)
+    data = json.load(f)
 
-print(f"Loaded {len(entities_data)} entities from JSON.")
-# Print sample structure of the first entity for verification
-print(json.dumps(entities_data[0], indent=2)[:500] + "...")
+# Prepare documents and embeddings list
+documents = []
+embeddings_list = []
+for item in data:
+    # Each `item` is expected to have 'text' (attribute description) and 'embedding' (1536-dim vector)
+    text = item.get('text') or item.get('attribute_text')  # adjust key as needed
+    embedding = item['embedding']
+    # Optional: include entity/attribute metadata if present in JSON
+    metadata = {}
+    if 'entity' in item:
+        metadata['entity'] = item['entity']
+    if 'attribute' in item:
+        metadata['attribute'] = item['attribute']
+    # Create a Document for this attribute
+    documents.append(Document(page_content=text, metadata=metadata))
+    embeddings_list.append(embedding)
+
+# Verify we have the same number of documents and embedding vectors
+print(f"Loaded {len(documents)} documents with {len(embeddings_list)} corresponding embeddings.")
 ```
 
-**Explanation:** We use the built-in `json` module to read the file. The path uses the `/dbfs/` prefix so that it can access the Databricks File System (DBFS). The snippet prints out the number of entities loaded and a truncated preview of the first entry to confirm the structure.
+Here we assume each JSON record provides a text content for the attribute (e.g. a description or definition) and a precomputed embedding vector. We preserve any entity or attribute names as metadata in the Document. The `embeddings_list` will be used to populate the FAISS index. Each embedding should be a list or array of 1536 float values.
 
-## Building the FAISS Vector Index from Attribute Embeddings
+## Build and Save the FAISS Vector Index
 
-Next, we will construct a FAISS vector index using the precomputed attribute embeddings. We need to extract each attribute's embedding and some identifying metadata to store alongside it. We'll use LangChain's FAISS integration to build a vector store that holds:
-
-* The text content for each attribute (we can use the attribute’s definition, possibly prefixed with its name)
-* The attribute’s metadata (name, entity name, table name)
-* The embedding vector for fast similarity search
-
-**Steps to build the index:**
-
-* Iterate through each entity entry and each attribute within it.
-* For each attribute, prepare a text string (e.g., `"Attribute Name: Attribute Definition"`) that represents the attribute's content.
-* Collect the attribute’s metadata (`attribute_name`, `entity_name`, `table_name`) in a dictionary.
-* Collect the embedding vector (as a list of floats).
-* Use `FAISS.from_embeddings` to create a vector store from the list of text–embedding pairs and metadata, using the same embedding model for queries.
-
-We'll use the OpenAI Embeddings class from LangChain (with model `text-embedding-ada-002`) as the embedding function for the vector store, so that query embeddings are generated in the same vector space. We set `normalize_L2=True` to normalize embeddings, enabling cosine similarity-based search using the L2 distance metric.
+Next, we construct a FAISS index and wrap it in LangChain’s `FAISS` vector store. We use a Flat L2 index (which performs brute-force similarity search in memory) with dimension 1536. We then add all embedding vectors to this index. Alongside the index, LangChain uses an in-memory docstore to hold the actual `Document` objects and a mapping from FAISS vector IDs to docstore IDs. We generate unique IDs for each document using UUIDs and build the mappings accordingly. Finally, we save the index (and accompanying data) to disk so it can be reused without rebuilding each time:
 
 ```python
-from langchain_community.vectorstores import FAISS
-from langchain.embeddings import OpenAIEmbeddings
+# Initialize FAISS index for 1536-dim embeddings
+dimension = len(embeddings_list[0])
+index = faiss.IndexFlatL2(dimension)
 
-# Initialize the OpenAI embeddings function for queries (1536-dim Ada embeddings)
-embedding_fn = OpenAIEmbeddings(model="text-embedding-ada-002")
+# Add all embeddings to the index (convert to float32 NumPy array)
+index.add(np.array(embeddings_list, dtype='float32'))
 
-# Prepare data for the vector store
-text_embedding_pairs = []   # list of (text, embedding) tuples
-metadatas = []              # list of metadata dicts
+# Prepare the docstore and id mappings
+ids = [str(uuid4()) for _ in documents]          # unique IDs for each document
+docstore = InMemoryDocstore({uid: doc for uid, doc in zip(ids, documents)})
+index_to_id = {i: uid for i, uid in enumerate(ids)}
 
-for entry in entities_data:
-    entity_info = entry.get("entity", {})  # entity metadata
-    table_name = entity_info.get("TABLE_NAME")
-    entity_name = entity_info.get("ENTITY NAME")
-    for attr in entry.get("attributes", []):
-        attr_name = attr.get("NAME")
-        attr_def  = attr.get("DEFINITION", "")
-        # Combine attribute name and definition as the text content
-        if attr_name and attr_def:
-            text = f"{attr_name}: {attr_def}"
-        elif attr_def:
-            text = attr_def
-        else:
-            text = attr_name or ""
-        # Get embedding vector (convert to list of floats if not already)
-        embedding_vector = attr.get("embedding", [])
-        # Only add if we have a valid embedding vector
-        if embedding_vector:
-            text_embedding_pairs.append((text, embedding_vector))
-            metadatas.append({
-                "attribute_name": attr_name,
-                "entity_name": entity_name,
-                "table_name": table_name
-            })
-
-# Build the FAISS vector store from the embeddings
-faiss_vectorstore = FAISS.from_embeddings(
-    text_embeddings=text_embedding_pairs,
-    embedding=embedding_fn,
-    metadatas=metadatas,
-    normalize_L2=True   # normalize vectors for cosine similarity search
+# Create the LangChain FAISS vector store with the index, docstore, and mapping
+embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")  # embedding model for queries
+vector_store = FAISS(
+    embedding_function=embedding_model,
+    index=index,
+    docstore=docstore,
+    index_to_docstore_id=index_to_id
 )
 
-print(f"FAISS index built with {len(text_embedding_pairs)} attribute embeddings.")
+# Save the FAISS index (this will create files under the given path)
+vector_store.save_local("/dbfs/FileStore/faiss_index")
+print(f"FAISS index built with {vector_store.index.ntotal} vectors and saved to disk.")
 ```
 
-In the code above, we use `FAISS.from_embeddings(...)` to create the vector index. This method takes an iterable of `(text, embedding)` pairs, the embedding function for queries, and the corresponding metadata. By setting `normalize_L2=True`, we ensure that both stored vectors and query vectors are normalized to unit length before comparison (making the L2 distance correspond to cosine similarity). After running this cell, `faiss_vectorstore` contains our vector index and an in-memory docstore of texts+metadata.
+We used `faiss.IndexFlatL2` for simplicity, which is an exact similarity search (sufficient for moderate dataset sizes). Each document was assigned a UUID and added to the `InMemoryDocstore`. We then instantiated `FAISS` with our pre-filled index, docstore, and ID mapping. LangChain’s `FAISS` wrapper will use the provided `embedding_function` (OpenAI's Ada model in our case) to embed query strings at query time. We save the index to `/dbfs/FileStore/faiss_index` – on Databricks, this path is persisted (DBFS).
 
-## Saving the FAISS Index and Metadata to DBFS
+**Note:** The `FAISS.save_local` method writes out the FAISS index and pickled metadata so that it can be reloaded later without recomputing. Now that the index is saved, we can load it in future sessions or on other cluster workers as needed.
 
-To use this index in future sessions or to share it between processes, we should save it to persistent storage. LangChain’s FAISS vectorstore provides a `save_local` method that saves:
+## Reload the FAISS Index from Disk
 
-* The FAISS index itself (to a `.faiss` file)
-* The accompanying metadata (to a pickle `.pkl` file containing the docstore and index-to-doc ID mappings)
-
-We'll choose a directory in DBFS to save these files. Make sure the path exists or use `save_local` to create it.
+To simulate using the index in a new session (or after cluster restarts), we can load the saved index from disk. LangChain provides `FAISS.load_local`, which reconstructs the vector store given the save directory, an embeddings object, and a flag to allow loading of pickled data. We must supply the same embedding function that was originally used (so that queries will be embedded consistently). We also enable `allow_dangerous_deserialization=True` because loading the stored index involves unpickling the metadata (LangChain requires this explicit flag as a safety measure):
 
 ```python
-# Define a directory path in DBFS to save the index and metadata
-index_save_path = "/dbfs/FileStore/faiss_index_demo"
+# Reinitialize the embedding model (ensure it matches the one used for the vectors)
+embedding_model = OpenAIEmbeddings(model="text-embedding-ada-002")
 
-# Save the FAISS index and metadata to the specified path
-faiss_vectorstore.save_local(folder_path=index_save_path)
-
-# List saved files (should see 'index.faiss' and 'index.pkl')
-import os
-print("Saved files:", os.listdir(index_save_path.replace("dbfs:", "/dbfs")))
-```
-
-After this step, the FAISS index is saved to `index.faiss` and the metadata to `index.pkl` in the chosen DBFS directory. These can be used to reload the vector store without rebuilding it from scratch.
-
-**Note:** In the above code, we replace the `dbfs:` scheme with the `/dbfs` mount point to use Python's `os.listdir` for verification (this is a common pattern in Databricks for file system operations).
-
-## Reloading the FAISS Index and Creating a Retriever
-
-Now we will demonstrate how to load the saved FAISS index and use it in a retrieval pipeline. We use the `FAISS.load_local` class method to load the index and docstore from disk. This requires providing the same embedding function used originally, so that query embeddings can be computed consistently.
-
-```python
-from langchain_community.vectorstores import FAISS
-
-# Load the FAISS vector store from the saved files
-# (allow_dangerous_deserialization=True is required to load the pickled metadata, assuming we trust this data source)
-faiss_index_loaded = FAISS.load_local(
-    folder_path=index_save_path,
-    embeddings=embedding_fn,
+# Load the FAISS vector store from disk
+new_vector_store = FAISS.load_local(
+    "/dbfs/FileStore/faiss_index",
+    embeddings=embedding_model,
     allow_dangerous_deserialization=True
 )
-
-# Create a retriever from the loaded vector store
-retriever = faiss_index_loaded.as_retriever(search_kwargs={"k": 3})
+print(f"Reloaded FAISS index with {new_vector_store.index.ntotal} vectors.")
 ```
 
-We set `k=3` in the `search_kwargs` so that the retriever will fetch the top 3 most similar attribute definitions for each query. You can adjust this `k` value based on how many context pieces you want to provide to the LLM. The retriever uses the FAISS index to find relevant documents (attribute texts) given a query, using cosine similarity under the hood (since we normalized vectors earlier).
+After loading, `new_vector_store` is an equivalent `FAISS` vector store containing our documents and ready for similarity search. At this point, we have a persistent vector index that we can query. All similarity searches will be handled by FAISS, using our precomputed embeddings, and will return the stored `Document` objects.
 
-*Security note:* We passed `allow_dangerous_deserialization=True` to `load_local` because it reads a pickle file for the metadata. This is safe here since the data was generated by us and stored in a secure location. In general, be cautious and only load pickled data from trusted sources.
+## Create a Retriever and the RetrievalQA Chain
 
-## Setting Up the LLM and Retrieval QA Chain
-
-With the retriever ready, we can create a Retrieval QA chain. This chain will use OpenAI's GPT-3.5-Turbo model to generate answers to questions, given the context retrieved from our FAISS index.
-
-**Components:**
-
-* **LLM (ChatOpenAI):** We use the chat model `gpt-3.5-turbo` via LangChain’s `ChatOpenAI` wrapper. We set a temperature of 0 for deterministic output (you can adjust as needed). Make sure to configure your OpenAI API key, for example by setting the environment variable `OPENAI_API_KEY` or using Databricks secrets.
-* **RetrievalQA Chain:** LangChain’s `RetrievalQA` will combine the retriever and LLM. It will automatically fetch relevant documents for a query and prompt the LLM to answer using those documents as context.
+With the vector store ready, we wrap it in a retriever interface and initialize a RetrievalQA chain using OpenAI’s GPT-3.5 Turbo as the LLM. The retriever is obtained via `vector_store.as_retriever()`, which returns a LangChain retriever object (by default, it will use similarity search on the vector store with k=4 or you can specify `search_kwargs={"k": K}` for a different number of results). For the LLM, we use `ChatOpenAI` from `langchain_openai` to access GPT-3.5. We then create a RetrievalQA chain that will use the retriever to fetch relevant documents and the chat model to generate an answer:
 
 ```python
-from langchain.chat_models import ChatOpenAI
+# Create a retriever from the vector store (default k=4 neighbors; adjust as needed)
+retriever = new_vector_store.as_retriever()
+
+# Initialize the OpenAI GPT-3.5 Turbo model (chat model) for generation
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)  # temperature=0 for deterministic output
+
+# Create the RetrievalQA chain using the LLM and the retriever
 from langchain.chains import RetrievalQA
-
-# Ensure your OpenAI API key is set (for example, via environment variable or Databricks secret)
-# For example:
-# import os
-# os.environ["OPENAI_API_KEY"] = "YOUR-OPENAI-API-KEY"
-
-# Initialize the OpenAI GPT-3.5 Turbo model
-llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0)
-
-# Set up the RetrievalQA chain with the LLM and retriever
 qa_chain = RetrievalQA.from_chain_type(
     llm=llm,
-    chain_type="stuff",             # "stuff" method to directly stuff retrieved docs into the prompt
     retriever=retriever,
-    return_source_documents=False   # we don't need to return source docs in the answer
+    chain_type="stuff"  # "stuff" method: directly stuff retrieved docs into prompt
 )
 ```
 
-Now, `qa_chain` is ready to answer questions. The chain will use our `retriever` to get the top matching attribute definitions for a query and then ask the LLM to formulate an answer based on that context.
+The `RetrievalQA` chain will take a query, use the retriever to do a similarity search in our FAISS index, and pass the resulting documents (as context) to the GPT-3.5 Turbo model. The model will then produce an answer (in our case, a description of the schema) based on that context. We set `temperature=0` for the LLM to reduce randomness and get more consistent results.
 
-*Note:* We used `chain_type="stuff"` which simply inserts the retrieved documents into the prompt. LangChain also supports other chain types like `"map_reduce"` or `"refine"` for more complex scenarios, but "stuff" is sufficient for many QA use-cases with smaller context sizes.
+*(LangChain’s `RetrievalQA` is a high-level chain that simplifies retrieval-augmented Q\&A. Under the hood, it’s equivalent to creating a prompt that injects retrieved documents and asking the LLM to answer. In LangChain v0.3.25, `RetrievalQA.from_chain_type` is a convenient way to set this up. Note that more recent versions might use `create_retrieval_chain`, but `RetrievalQA` remains available for now.)*
 
-## Querying the QA System and Getting Results
+## Generate AI-Based Descriptions for Each Schema
 
-Finally, we can query the system with natural language questions. The RetrievalQA chain will produce an answer string. We also want to capture the metadata of the top-matching attribute for each query (attribute name, entity name, table name, and similarity score), as requested.
-
-We will run a few example queries and collect the results in a pandas DataFrame for clarity. Each row will contain:
-
-* **query:** The input question asked.
-* **answer:** The answer generated by GPT-3.5-Turbo.
-* **top\_match\_attribute:** Name of the highest-scoring attribute that was retrieved.
-* **entity\_name:** Name of the entity (or table) that this attribute belongs to.
-* **table\_name:** The table name associated with the entity/attribute.
-* **score:** The similarity score for the top attribute (note: this is the L2 distance if using normalized vectors, where a lower score means higher similarity).
+Finally, we load our pandas DataFrame that contains a column `schemas_name` for which we want to generate descriptions. For each row in this DataFrame, we will use the retrieval QA chain to get an AI-generated description and append it as a new column `ai_generate`. We can simply loop over the DataFrame rows and call `qa_chain.run()` with the schema name as the query. The chain will retrieve relevant info from the FAISS index and produce a description using GPT-3.5:
 
 ```python
-import pandas as pd
+# Example: Load the DataFrame of schema names (replace with actual data source or Spark conversion as needed)
+df = pd.read_csv("/dbfs/FileStore/schemas.csv")  # contains a column 'schemas_name'
 
-# Example queries to test the QA system
-queries = [
-    "What attribute contains the customer's email address?",
-    "Give me the definition of the Order ID field."
-]
+# For each schema, query the chain to get a description
+descriptions = []
+for name in df['schemas_name']:
+    query = f"Describe the '{name}' schema."  # formulate a query for the schema name
+    result = qa_chain.run(query)
+    descriptions.append(result)
 
-results = []
-for q in queries:
-    # Get answer from the QA chain
-    answer = qa_chain.run(q)
-    # Retrieve the top matching attribute and its score
-    top_docs_with_score = faiss_index_loaded.similarity_search_with_score(q, k=1)
-    top_doc, top_score = top_docs_with_score[0]
-    meta = top_doc.metadata
-    results.append({
-        "query": q,
-        "answer": answer,
-        "top_match_attribute": meta.get("attribute_name", ""),
-        "entity_name": meta.get("entity_name", ""),
-        "table_name": meta.get("table_name", ""),
-        "score": top_score
-    })
+# Append the results as a new column in the DataFrame
+df['ai_generate'] = descriptions
 
-# Convert results to a pandas DataFrame for display
-df_results = pd.DataFrame(results)
-df_results
+# Display a few examples
+print(df[['schemas_name', 'ai_generate']].head(5).to_string(index=False))
 ```
 
-The resulting DataFrame `df_results` will show each query, the answer, and details of the top-matching attribute that was used to find the answer. For example, you might see something like:
+In the above code, we construct a simple prompt (`"Describe the '<name>' schema."`) using each schema name. This query is passed to the RetrievalQA chain, which returns a description generated by the LLM. We collect all results and add them to the DataFrame under `ai_generate`. At the end, each row in `df` will have the original `schemas_name` and a corresponding AI-generated description.
 
-| query                                     | answer                                    | top\_match\_attribute | entity\_name | table\_name   | score  |
-| ----------------------------------------- | ----------------------------------------- | --------------------- | ------------ | ------------- | ------ |
-| What attribute contains the customer's... | The attribute **Email Address** stores... | Email Address         | Customer     | CUSTOMER\_TBL | 0.0... |
-| Give me the definition of the Order ID... | **Order ID** is the unique identifier...  | Order ID              | Orders       | ORDER\_TABLE  | 0.0... |
+**Note:** Iterating with `iterrows()` or a Python loop is straightforward but may be slow if you have many schemas (as it calls the LLM for each row). If performance is a concern, you could vectorize this with Pandas `apply` or use asynchronous calls to the chain. In this example, we assume the number of schemas is manageable. Also, ensure that your OpenAI API usage is within allowable limits, as this will send one request per schema.
 
-Each answer is generated by the LLM using the definition of the top attributes (and possibly a couple of others, since we set `k=3` for context). The **score** column shows the FAISS similarity score of the top attribute. If using normalized cosine similarity with L2 distance, a score closer to 0 indicates a very close match (0 would mean identical embedding, in theory).
+## Conclusion
 
-You can now ask new questions by adding to the `queries` list or integrating this `qa_chain` into an application. The system will retrieve the most relevant attribute definitions and use them to answer your questions, providing traceability via the attribute metadata.
+We have built a Databricks-compatible workflow for generating schema descriptions using a FAISS vector store and LangChain. The steps included loading precomputed Ada embeddings, indexing them with FAISS, and using LangChain’s retriever and `RetrievalQA` chain with GPT-3.5 Turbo to produce natural language descriptions. All similarity searches are handled locally by FAISS (using our stored embeddings), and the generation of the description is done by OpenAI’s model via LangChain. By saving the FAISS index to disk, we ensure the index can be reused efficiently across sessions without recomputation. This approach showcases how to implement retrieval-augmented generation in a production environment like Databricks, combining efficient vector search with powerful language models.
