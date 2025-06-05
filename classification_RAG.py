@@ -1,3 +1,330 @@
+Thanks! I’ll now provide production-ready Python code that:
+
+* Uses a `.env` file to securely manage all DB and Azure OpenAI credentials.
+* Supports Azure OpenAI (with deployment name, API base, API key, and version).
+* Includes structured error handling, logging, and modular function design.
+
+I’ll update you shortly with the full refactored code and dotenv integration.
+
+
+# Production-Ready Embedding and Classification Pipeline
+
+To fulfill the requirements, we refactored the embedding and classification pipeline with proper environment variable management, Azure OpenAI configuration, error handling, modular structure, and CLI support. Below we outline the key changes and then provide the complete code and an example `.env` file.
+
+## Environment Variables Management with `.env`
+
+We use **python-dotenv** to load configuration from a `.env` file, avoiding hard-coded secrets and following 12-factor app principles. All sensitive parameters (database credentials and Azure OpenAI keys/URLs) are stored in the `.env` file and loaded via `load_dotenv`. The required keys in `.env` are:
+
+* **PostgreSQL settings:** `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
+* **Azure OpenAI settings:** `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_API_BASE` (the endpoint URL), `AZURE_OPENAI_API_VERSION`, `AZURE_OPENAI_DEPLOYMENT_NAME`
+
+Using `load_dotenv()` will read these values and make them available via `os.getenv`. This keeps credentials secure and easily configurable.
+
+## Azure OpenAI Embedding Configuration
+
+The code is configured to use **Azure OpenAI**'s `text-embedding-ada-002` model for embeddings. We set `openai.api_type = "azure"` and supply the `api_base`, `api_version`, and `api_key` from environment variables. Notably, Azure OpenAI requires using the *deployment name* for the model (not just the model name) in API calls. Thus, we pass the deployment name (from `AZURE_OPENAI_DEPLOYMENT_NAME`) when requesting embeddings. The `text-embedding-ada-002` model produces 1536-dimensional vectors, so our database schema uses `VECTOR(1536)` for storage.
+
+When generating an embedding, we replace any newline characters in the text with spaces (as recommended for better embedding quality) and call the Azure OpenAI embeddings endpoint. We handle Azure OpenAI API errors with try/except blocks to ensure the application logs the error and continues or exits gracefully, as appropriate (production code should handle such errors properly).
+
+## PostgreSQL and pgvector Setup
+
+We ensure the **pgvector** extension is enabled and the database table is configured with a vector column for embeddings. On startup, the code executes:
+
+* `CREATE EXTENSION IF NOT EXISTS vector;` – enables pgvector (logged as a warning if the database user lacks permission, but we proceed if it's already installed).
+* `CREATE TABLE IF NOT EXISTS embeddings (...)` – creates a table with columns for `id` (primary key), `text`, `embedding VECTOR(1536)`, and `label`. The vector dimension 1536 matches the OpenAI embedding size.
+
+We also create a vector index on the embedding column for efficient similarity search:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_embeddings_embedding 
+ON embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+```
+
+This uses the IVF Flat index with cosine distance, as cosine similarity is recommended for OpenAI embeddings. The index significantly speeds up the nearest-neighbor search on the `embedding` column.
+
+## Modular Code Structure and Error Handling
+
+The pipeline is structured into clear components:
+
+* **`load_data(file_path)`** – reads input data (e.g. a CSV) and returns a list of texts and labels for ingestion.
+* **`generate_embedding(text)`** – calls the Azure OpenAI API to get the embedding vector for a given text.
+* **`ensure_database(conn)`** – ensures the pgvector extension, table, and index exist in the PostgreSQL database.
+* **`ingest_data(conn, data_list)`** – orchestrates the ingestion process: for each record, generates embedding and inserts it into the DB.
+* **`classify_text(conn, text)`** – generates an embedding for the input text and finds the closest stored vector in the database to predict the label (k-Nearest Neighbor classification with k=1).
+
+Each function has try/except blocks to catch errors. We log meaningful messages at each step (using Python’s `logging` module). For example, database connection issues, OpenAI API errors, or insertion failures are caught and logged as errors, with the program safely terminating or skipping problematic records. This structured error handling ensures the pipeline can run reliably in production, with visibility into any issues via logs.
+
+A basic logging configuration is set at startup (`logging.basicConfig(...)`) to include timestamps and log levels, helping with debugging and monitoring in production. Key actions (connecting to DB, successful insertion count, classification result, etc.) are logged at INFO level, while exceptions are logged at ERROR level (including the exception details).
+
+## CLI Support with `argparse`
+
+The script supports command-line execution for two modes: **ingestion** and **classification**. We use the `argparse` library to define sub-commands:
+
+* `ingest`: Ingests data from a provided file (e.g. `--file data.csv`) and stores embeddings in the database.
+* `classify`: Classifies a given input text (provided via `--text "some query"`) by finding the nearest embedding in the database and returning the associated label.
+
+This allows running the script as:
+
+```bash
+# Ingest data from a CSV file
+python pipeline.py ingest --file data.csv
+
+# Classify a new text input
+python pipeline.py classify --text "Your input text here"
+```
+
+The argparse configuration ensures the required arguments are present for each mode and prints usage help if needed. This makes the tool easy to use from the command line in different scenarios.
+
+Below is the complete refactored Python code, followed by an example `.env` template:
+
+## Refactored Pipeline Code (Python)
+
+```python
+import os
+import logging
+import argparse
+from dotenv import load_dotenv
+import openai
+import psycopg2
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Read database connection info from environment
+PG_HOST = os.getenv("POSTGRES_HOST")
+PG_PORT = os.getenv("POSTGRES_PORT")
+PG_DB   = os.getenv("POSTGRES_DB")
+PG_USER = os.getenv("POSTGRES_USER")
+PG_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+
+# Read Azure OpenAI config from environment
+AZURE_API_KEY       = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_API_BASE      = os.getenv("AZURE_OPENAI_API_BASE")      # e.g. "https://<resource>.openai.azure.com/"
+AZURE_API_VERSION   = os.getenv("AZURE_OPENAI_API_VERSION")   # e.g. "2023-05-15"
+AZURE_DEPLOYMENT    = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")  # Deployment name for text-embedding-ada-002
+
+# Validate critical env variables
+if not all([PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASSWORD, AZURE_API_KEY, AZURE_API_BASE, AZURE_API_VERSION, AZURE_DEPLOYMENT]):
+    logging.error("Missing one or more required environment variables. Please check your .env file.")
+    exit(1)
+
+# Configure OpenAI API for Azure
+openai.api_type = "azure"
+openai.api_key = AZURE_API_KEY
+openai.api_base = AZURE_API_BASE
+openai.api_version = AZURE_API_VERSION
+
+# Constants
+TABLE_NAME = "embeddings"   # database table for storing embeddings
+
+def ensure_database(conn):
+    """Ensure the pgvector extension, embeddings table, and index exist in the database."""
+    try:
+        with conn.cursor() as cur:
+            # Enable pgvector extension if not already enabled
+            try:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                conn.commit()
+            except Exception as e:
+                # Log a warning if extension creation fails (e.g., due to permissions)
+                logging.warning("Could not enable pgvector extension (might require superuser): %s", e)
+                conn.rollback()
+            # Create the embeddings table if not exists
+            create_table_sql = f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                id SERIAL PRIMARY KEY,
+                text TEXT,
+                embedding VECTOR(1536),
+                label TEXT
+            );
+            """
+            cur.execute(create_table_sql)
+            # Create an index on the vector column for efficient nearest-neighbor search (cosine distance)
+            create_index_sql = f"""
+            CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_embedding
+            ON {TABLE_NAME}
+            USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+            """
+            cur.execute(create_index_sql)
+            conn.commit()
+    except Exception as e:
+        logging.error("Database setup failed: %s", e)
+        conn.rollback()
+        raise  # re-raise exception to abort if we cannot set up the database
+
+def load_data(file_path):
+    """Load data from the given file. Expecting a CSV with 'text' and 'label' columns."""
+    import csv
+    data = []
+    try:
+        with open(file_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if 'text' in row:
+                    text = row['text']
+                    label = row.get('label', None)
+                    data.append((text, label))
+                else:
+                    # If no header, assume each line is the text and label is unknown
+                    line = list(row.keys())[0]  # the entire line
+                    data.append((line, None))
+    except Exception as e:
+        logging.error("Failed to load data from file %s: %s", file_path, e)
+        raise
+    logging.info("Loaded %d records from %s", len(data), file_path)
+    return data
+
+def generate_embedding(text):
+    """Generate embedding vector for the given text using Azure OpenAI."""
+    # Replace newlines to improve embedding quality as per OpenAI guidance
+    text = text.replace("\n", " ")
+    try:
+        response = openai.Embedding.create(input=text, engine=AZURE_DEPLOYMENT)
+        embedding = response['data'][0]['embedding']
+        return embedding
+    except Exception as e:
+        # Log the error and propagate it
+        logging.error("OpenAI embedding API call failed: %s", e)
+        raise
+
+def ingest_data(conn, data_list):
+    """Generate embeddings for each text in data_list and insert into the database."""
+    try:
+        ensure_database(conn)
+    except Exception as e:
+        logging.critical("Database initialization failed, aborting ingestion.")
+        return
+
+    inserted_count = 0
+    # Use a cursor for insertion
+    with conn.cursor() as cur:
+        for text, label in data_list:
+            try:
+                emb = generate_embedding(text)
+            except Exception as e:
+                # If embedding generation fails, skip this record and continue
+                logging.error("Skipping text due to embedding failure: %s", e)
+                continue
+            try:
+                # Insert the text, embedding vector, and label into the table
+                cur.execute(
+                    f"INSERT INTO {TABLE_NAME} (text, embedding, label) VALUES (%s, %s, %s);",
+                    (text, emb, label)
+                )
+                inserted_count += 1
+                # Commit each insert to avoid transaction issues on error
+                conn.commit()
+            except Exception as e:
+                logging.error("Failed to insert record into database: %s", e)
+                conn.rollback()
+                # continue to next record without terminating entire ingestion
+                continue
+    logging.info("Ingestion complete: %d records inserted.", inserted_count)
+
+def classify_text(conn, input_text):
+    """Classify the input_text by finding the nearest embedding in the database and returning its label."""
+    try:
+        query_emb = generate_embedding(input_text)
+    except Exception as e:
+        logging.error("Failed to generate embedding for input text: %s", e)
+        return None
+    try:
+        with conn.cursor() as cur:
+            # Find the closest vector in the table using cosine distance (<=> operator)
+            cur.execute(
+                f"SELECT label FROM {TABLE_NAME} ORDER BY embedding <=> %s LIMIT 1;",
+                (query_emb,)
+            )
+            result = cur.fetchone()
+            if result:
+                return result[0]  # label of nearest neighbor
+            else:
+                return None
+    except Exception as e:
+        logging.error("Database query failed during classification: %s", e)
+        return None
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Embedding & Classification Pipeline")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subparser for ingestion
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest data and store embeddings in the database")
+    ingest_parser.add_argument("--file", type=str, required=True, help="Path to input CSV file with 'text' and 'label' columns")
+
+    # Subparser for classification
+    classify_parser = subparsers.add_parser("classify", help="Classify an input text using nearest neighbor in the embeddings")
+    classify_parser.add_argument("--text", type=str, required=True, help="Text input to classify")
+
+    args = parser.parse_args()
+
+    # Connect to PostgreSQL database
+    try:
+        conn = psycopg2.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            database=PG_DB,
+            user=PG_USER,
+            password=PG_PASSWORD
+        )
+        logging.info("Connected to PostgreSQL database %s at %s:%s", PG_DB, PG_HOST, PG_PORT)
+    except Exception as e:
+        logging.critical("Failed to connect to the PostgreSQL database: %s", e)
+        exit(1)
+
+    # Run the chosen subcommand
+    if args.command == "ingest":
+        data_list = load_data(args.file)
+        ingest_data(conn, data_list)
+    elif args.command == "classify":
+        label = classify_text(conn, args.text)
+        if label is not None:
+            logging.info("Input text classified as: %s", label)
+            print(f"Predicted label: {label}")
+        else:
+            logging.info("No similar embedding found or classification failed.")
+            print("No classification result available.")
+
+    # Close the database connection
+    conn.close()
+```
+
+## Example `.env` File Template
+
+```bash
+# PostgreSQL database credentials
+POSTGRES_HOST=your_postgres_host
+POSTGRES_PORT=5432
+POSTGRES_DB=your_database_name
+POSTGRES_USER=your_db_username
+POSTGRES_PASSWORD=your_db_password
+
+# Azure OpenAI Service credentials and deployment info
+AZURE_OPENAI_API_KEY=your_azure_openai_api_key
+AZURE_OPENAI_API_BASE=https://your-resource-name.openai.azure.com/  # include trailing slash
+AZURE_OPENAI_API_VERSION=2023-05-15  # example API version for embeddings
+AZURE_OPENAI_DEPLOYMENT_NAME=your_embedding_deployment_name
+```
+
+**Notes:** Ensure you have deployed the `text-embedding-ada-002` model on Azure and use its deployment name in the `.env` file. The PostgreSQL database must have the pgvector extension installed (the script attempts to enable it). After setting up the `.env` file, you can run the ingestion and classification as shown above. This refactored pipeline uses secure practices for configuration, proper error handling/logging, and a modular design for maintainability, making it production-ready.
+
+**Sources:**
+
+* Use of python-dotenv for loading environment variables
+* Azure OpenAI embedding setup with `text-embedding-ada-002` and deployment name
+* pgvector storage of 1536-dimension embeddings and recommended cosine similarity
+* Inserting and querying vectors in PostgreSQL with psycopg2 and pgvector
+* Creating an IVF flat index on vector column for efficient similarity search
+
+
+
+
+
+
+####################################
 Great! I’ll generate a complete Python code example that:
 
 1. Reads your Excel file.
