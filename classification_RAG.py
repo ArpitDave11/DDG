@@ -1,3 +1,221 @@
+import os
+import time
+import requests
+import numpy as np
+import openai
+import psycopg2
+import collections
+
+# -------------------------------
+# 1) YOUR CUSTOM EMBEDDING FUNCTION
+# -------------------------------
+def get_embedding(text: str) -> list[float]:
+    """
+    Calls your Azure embeddings endpoint to get a single embedding.
+    Expects:
+      - An environment variable "api_key" containing the Azure OpenAI key.
+      - An environment variable "embed_api_endpoint" with the full endpoint URL 
+        (e.g. "https://<your-resource>.openai.azure.com/openai/deployments/<deployment-id>/embeddings").
+    Returns:
+      A list of floats (the embedding vector).
+    """
+    api_version = "2023-05-15"
+    headers = {
+        "Content-Type": "application/json",
+        "api-key": os.getenv("api_key"),
+    }
+    data = {"input": text}
+    endpoint = os.getenv("embed_api_endpoint")
+    response = requests.post(f"{endpoint}?api-version={api_version}", headers=headers, json=data)
+    response.raise_for_status()
+    time.sleep(0.5)  # throttle slightly to avoid rate limits
+    return response.json()["data"][0]["embedding"]
+
+
+# -------------------------------
+# 2) ASSUME conn IS A LIVE psycopg2 CONNECTION
+# -------------------------------
+# For example:
+# conn = psycopg2.connect(
+#     host=DB_HOST, port=DB_PORT, database=DB_NAME,
+#     user=DB_USER, password=DB_PASS
+# )
+
+# Ensure your Azure Chat credentials are set if using AzureChatOpenAI for fallback or other logic
+openai.api_key = os.getenv("OPENAI_API_KEY", "")
+# If using AzureChatOpenAI:
+# openai.api_type = "azure"
+# openai.api_base = os.getenv("OPENAI_API_BASE")
+# openai.api_version = os.getenv("OPENAI_API_VERSION", "2023-05-15")
+
+
+def classify_attribute_rag(
+    name: str,
+    definition: str,
+    examples: str = "",
+    comments: str = "",
+    top_k: int = 5,
+    chat_model: str = "gpt-4o"  # or your Azure‐deployed chat model
+) -> dict | None:
+    """
+    RAG‐powered classifier for a new attribute using your custom get_embedding().
+    Steps:
+      1. Embed the new attribute text via get_embedding().
+      2. Retrieve top_k nearest neighbors from PGVector.
+      3. Build a prompt that includes the new attribute + those neighbors (with their labels).
+      4. Call ChatCompletion to get the final classification.
+
+    Returns:
+      A dict with keys: "CID status", "CID category", "Attributes Sub-category", or None on failure.
+    """
+
+    # 1. Embed the new attribute using your REST endpoint
+    query_text = f"{name} | Definition: {definition} | Examples: {examples} | Comments: {comments}"
+    try:
+        raw_embedding = get_embedding(query_text)  # returns List[float]
+    except Exception as e:
+        print("Failed to get embedding:", e)
+        return None
+
+    query_embedding = np.array(raw_embedding, dtype=float)
+
+    # 2. Retrieve top_k neighbors (their labels + example text)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                "Attribute Name",
+                "Attribute Definition",
+                "Examples",
+                "Comments",
+                "CID status",
+                "CID category",
+                "Attributes Sub-category"
+            FROM attributes
+            ORDER BY embedding <-> %s
+            LIMIT %s;
+            """,
+            (query_embedding.tolist(), top_k)  # psycopg2 can accept a Python list for pgvector
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        print("No neighbors found; falling back to simple majority vote.")
+        return _fallback_majority_vote(query_embedding, top_k)
+
+    # 3. Build a prompt for ChatCompletion
+    prompt_examples = []
+    for idx, row in enumerate(rows, start=1):
+        nbr_name, nbr_def, nbr_ex, nbr_comm, nbr_cid, nbr_cat, nbr_subcat = row
+        example_text = (
+            f"{idx}. ATTRIBUTE TEXT:\n"
+            f"   Name: {nbr_name}\n"
+            f"   Definition: {nbr_def}\n"
+            f"   Examples: {nbr_ex}\n"
+            f"   Comments: {nbr_comm}\n"
+            f"   → Known Labels:\n"
+            f"     • CID status: {nbr_cid}\n"
+            f"     • CID category: {nbr_cat}\n"
+            f"     • Attributes Sub-category: {nbr_subcat}\n"
+        )
+        prompt_examples.append(example_text)
+
+    neighbors_block = "\n\n".join(prompt_examples)
+
+    # SYSTEM prompt: Define the role/instruction
+    system_msg = (
+        "You are a concise, no-nonsense data-classification assistant. "
+        "Given a new attribute (with name, definition, examples, comments) and a handful of "
+        "similar examples (each with their known CID status, CID category, and Sub-category), "
+        "decide the best classification for the new attribute."
+    )
+
+    # USER prompt: Combine the new attribute + the retrieved examples
+    user_msg = (
+        "NEW ATTRIBUTE TO CLASSIFY:\n"
+        f"   Name: {name}\n"
+        f"   Definition: {definition}\n"
+        f"   Examples: {examples}\n"
+        f"   Comments: {comments}\n\n"
+        "RETRIEVED EXAMPLES (with labels):\n"
+        f"{neighbors_block}\n\n"
+        "Using only the information above, output a JSON object with exactly these three fields:\n"
+        '  {\n'
+        '    "CID status": "CID" or "Non-CID",\n'
+        '    "CID category": "Category_A" or "Category_B" or "Category_C" or "Category_D",\n'
+        '    "Attributes Sub-category": "<the exact subcategory text>"\n'
+        '  }\n'
+        "Be sure to choose the best labels based on the examples. Do NOT include any extra keys, commentary, or formatting.\n"
+        "If it's unclear, choose the most frequent labels among the examples but justify briefly in your own reasoning (not in the JSON)."
+    )
+
+    # 4. Call ChatCompletion
+    try:
+        chat_resp = openai.ChatCompletion.create(
+            model=chat_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=0.0,
+            max_tokens=200
+        )
+    except Exception as e:
+        print("ChatCompletion API call failed:", e)
+        return _fallback_majority_vote(query_embedding, top_k)
+
+    content = chat_resp["choices"][0]["message"]["content"].strip()
+    try:
+        # Strip triple backticks if present
+        if content.startswith("```"):
+            content = content.strip("```").strip()
+        result = __import__("json").loads(content)
+    except Exception as e:
+        print("Failed to parse JSON from LLM response:", e)
+        print("LLM returned:", content)
+        print("Falling back to majority vote among neighbors.")
+        return _fallback_majority_vote(query_embedding, top_k)
+
+    return result
+
+
+def _fallback_majority_vote(query_embedding: np.ndarray, top_k: int) -> dict | None:
+    """
+    If RAG generation fails or no neighbors, do a basic nearest-neighbor majority vote.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT "CID status", "CID category", "Attributes Sub-category"
+            FROM attributes
+            ORDER BY embedding <-> %s
+            LIMIT %s;
+            """,
+            (query_embedding.tolist(), top_k)
+        )
+        neighbors = cur.fetchall()
+
+    if not neighbors:
+        return None
+
+    cid_status_votes = [n[0] for n in neighbors]
+    cid_category_votes = [n[1] for n in neighbors]
+    subcat_votes = [n[2] for n in neighbors]
+
+    pred_status = collections.Counter(cid_status_votes).most_common(1)[0][0]
+    pred_category = collections.Counter(cid_category_votes).most_common(1)[0][0]
+    pred_subcat = collections.Counter(subcat_votes).most_common(1)[0][0]
+
+    return {
+        "CID status": pred_status,
+        "CID category": pred_category,
+        "Attributes Sub-category": pred_subcat
+    }
+
+
+
+############################
+
 Thanks! I’ll now provide production-ready Python code that:
 
 * Uses a `.env` file to securely manage all DB and Azure OpenAI credentials.
