@@ -1,3 +1,163 @@
+import os
+import psycopg2
+import numpy as np
+import collections
+import pandas as pd
+import openai
+
+# -----------------------------------------------------------------------------
+# 0. Set up your OpenAI / Azure OpenAI credentials
+# -----------------------------------------------------------------------------
+openai.api_key    = os.getenv("OPENAI_API_KEY")
+# If using Azure OpenAI:
+# openai.api_type    = "azure"
+# openai.api_base    = os.getenv("AZURE_OPENAI_ENDPOINT")
+# openai.api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+
+# -----------------------------------------------------------------------------
+# 1. your embedding function (must return a numpy.ndarray)
+# -----------------------------------------------------------------------------
+def get_embedding(text: str) -> np.ndarray:
+    # … your code here …
+    raise NotImplementedError
+
+# -----------------------------------------------------------------------------
+# 2. wrap the pgvector‐based classifier in a function
+# -----------------------------------------------------------------------------
+def classify_cid(name: str, example: str, top_k: int = 5) -> dict:
+    query_text = f"Name: {name}\nExamples: {example}"
+    query_emb  = get_embedding(query_text)
+
+    conn = psycopg2.connect(
+        host=os.getenv("PG_HOST"),
+        port=os.getenv("PG_PORT"),
+        database=os.getenv("PG_DB"),
+        user=os.getenv("PG_USER"),
+        password=os.getenv("PG_PASSWORD"),
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    cid_status,
+                    cid_category,
+                    attributes_sub_category,
+                    embedding <-> %s::vector AS distance
+                FROM public.knowledge_store_cid
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s;
+                """,
+                (query_emb, query_emb, top_k)
+            )
+            rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "CID status":             None,
+                "CID category":           None,
+                "Attributes sub-category": None,
+            }
+
+        # vote for each field
+        status_votes   = [r[0] for r in rows]
+        category_votes = [r[1] for r in rows]
+        subcat_votes   = [r[2] for r in rows]
+
+        return {
+            "CID status":             collections.Counter(status_votes).most_common(1)[0][0],
+            "CID category":           collections.Counter(category_votes).most_common(1)[0][0],
+            "Attributes sub-category": collections.Counter(subcat_votes).most_common(1)[0][0],
+        }
+    finally:
+        conn.close()
+
+# -----------------------------------------------------------------------------
+# 3. map to RAG
+# -----------------------------------------------------------------------------
+def map_rag_category(cid_category: str) -> str:
+    if cid_category in {"Category_A", "Category_B", "Category_C"}:
+        return "Red"
+    elif cid_category == "Category_D":
+        return "Amber"
+    elif cid_category is None or pd.isna(cid_category):
+        return None
+    else:
+        return "Green"
+
+# -----------------------------------------------------------------------------
+# 4. ask the LLM for a plain-English justification
+# -----------------------------------------------------------------------------
+def justify_classification(
+    name: str,
+    example: str,
+    cid_status: str,
+    cid_category: str,
+    subcat: str
+) -> str:
+    prompt = f"""
+You are a helpful assistant. 
+An attribute with:
+  • Name: "{name}"
+  • Example: "{example}"
+has been classified as:
+  • CID status: {cid_status}
+  • CID category: {cid_category}
+  • Attributes sub-category: {subcat}
+
+In 2–3 sentences of plain English, explain *why* this classification makes sense, referring to the example.
+"""
+    resp = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role":"user","content": prompt}],
+        temperature=0.5,
+        max_tokens=100
+    )
+    return resp.choices[0].message.content.strip()
+
+# -----------------------------------------------------------------------------
+# 5. apply to your DataFrame
+# -----------------------------------------------------------------------------
+# assume df is your input with columns "COLUMN_NAME" and "EXAMPLE"
+# e.g.
+# df = pd.DataFrame({
+#     "COLUMN_NAME": ["Military ID", "Custom Attr", …],
+#     "EXAMPLE":     ["ID 12345",       "foo=bar",     …]
+# })
+
+# 5a) classify each row
+cls = df.apply(
+    lambda row: classify_cid(row["COLUMN_NAME"], row["EXAMPLE"]),
+    axis=1
+)
+cls_df = pd.DataFrame(cls.tolist(), index=df.index)
+
+# 5b) attach and compute RAG
+df = pd.concat([df, cls_df], axis=1)
+df["RAG_Category"] = df["CID category"].apply(map_rag_category)
+
+# 5c) generate justifications
+df["Justification"] = df.apply(
+    lambda r: justify_classification(
+        r["COLUMN_NAME"],
+        r["EXAMPLE"],
+        r["CID status"],
+        r["CID category"],
+        r["Attributes sub-category"]
+    ), axis=1
+)
+
+# final columns:
+# ["COLUMN_NAME","EXAMPLE","CID status","CID category",
+#  "Attributes sub-category","RAG_Category","Justification"]
+print(df.head())
+
+
+
+
+
+
+#######################
 Below is a **refined classification framework** that builds on your existing Categories **A, B, C, D**—but adds **extra clarity** to handle:
 
 * **Official overrides** (where your documentation explicitly says something is A/B/C/D).
