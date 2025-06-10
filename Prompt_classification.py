@@ -3,23 +3,29 @@ import psycopg2
 import numpy as np
 import collections
 import pandas as pd
-import openai
+
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage
 
 # -----------------------------------------------------------------------------
-# 0. OpenAI / Azure OpenAI setup
+# 0. Azure OpenAI setup (via LangChain’s AzureChatOpenAI)
 # -----------------------------------------------------------------------------
-openai.api_key    = os.getenv("OPENAI_API_KEY")
-# (or set api_type/base/version if you use Azure)
+azure_llm = AzureChatOpenAI(
+    deployment_name    = os.getenv("AZURE_CHAT_DEPLOYMENT_NAME"),  # e.g. "gpt-35-turbo"
+    openai_api_base    = os.getenv("AZURE_OPENAI_ENDPOINT"),       # e.g. "https://my-resource.openai.azure.com/"
+    openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION"),    # e.g. "2023-05-15"
+    openai_api_key     = os.getenv("AZURE_OPENAI_KEY"),
+)
 
 # -----------------------------------------------------------------------------
-# 1. your embedding function
+# 1. your embedding function (unchanged)
 # -----------------------------------------------------------------------------
 def get_embedding(text: str) -> np.ndarray:
-    # … your implementation here …
+    # … your Azure or OpenAI embedding call …
     raise NotImplementedError
 
 # -----------------------------------------------------------------------------
-# 2. vector‐lookup + voting classifier, now using name/definition/examples
+# 2. vector‐lookup + voting classifier
 # -----------------------------------------------------------------------------
 def classify_cid(
     name: str,
@@ -27,12 +33,7 @@ def classify_cid(
     examples: str,
     top_k: int = 5
 ) -> dict:
-    # build the prompt for embedding
-    query_text = (
-        f"Name: {name}\n"
-        f"Definition: {definition}\n"
-        f"Examples: {examples}"
-    )
+    query_text = f"Name: {name}\nDefinition: {definition}\nExamples: {examples}"
     query_emb = get_embedding(query_text)
 
     conn = psycopg2.connect(
@@ -60,13 +61,8 @@ def classify_cid(
             rows = cur.fetchall()
 
         if not rows:
-            return {
-                "CID status":             None,
-                "CID category":           None,
-                "Attributes sub-category": None,
-            }
+            return {"CID status": None, "CID category": None, "Attributes sub-category": None}
 
-        # majority vote each field
         status_votes   = [r[0] for r in rows]
         category_votes = [r[1] for r in rows]
         subcat_votes   = [r[2] for r in rows]
@@ -83,7 +79,7 @@ def classify_cid(
 # 3. map to RAG
 # -----------------------------------------------------------------------------
 def map_rag_category(cid_category: str) -> str:
-    if cid_category in {"Category_A", "Category_B", "Category_C"}:
+    if cid_category in {"Category_A","Category_B","Category_C"}:
         return "Red"
     elif cid_category == "Category_D":
         return "Amber"
@@ -93,7 +89,7 @@ def map_rag_category(cid_category: str) -> str:
         return "Green"
 
 # -----------------------------------------------------------------------------
-# 4. justification via LLM
+# 4. justify via AzureChatOpenAI
 # -----------------------------------------------------------------------------
 def justify_classification(
     name: str,
@@ -104,37 +100,33 @@ def justify_classification(
     subcat: str
 ) -> str:
     prompt = f"""
-An attribute with:
+An attribute has:
   • Name: "{name}"
   • Definition: "{definition}"
   • Examples: "{examples}"
-was classified as:
+
+It was classified as:
   • CID status: {cid_status}
   • CID category: {cid_category}
-  • Attributes sub-category: {subcat}
+  • Sub-category: {subcat}
 
-In 2–3 sentences, explain in plain English why this classification makes sense.
+In 2–3 sentences of plain English, explain why this classification makes sense.
 """
-    resp = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role":"user","content": prompt}],
-        temperature=0.3,
-        max_tokens=100
-    )
-    return resp.choices[0].message.content.strip()
+    response = azure_llm([HumanMessage(content=prompt)])
+    return response.content.strip()
 
 # -----------------------------------------------------------------------------
 # 5. apply to your DataFrame
 # -----------------------------------------------------------------------------
-# assume df has columns: "COLUMN_NAME", "COLUMN_DEFINITION", "EXAMPLE"
-# e.g.
+# Assume df with ["COLUMN_NAME","COLUMN_DEFINITION","EXAMPLE"]
+# Example:
 # df = pd.DataFrame({
-#     "COLUMN_NAME":       ["Military ID",    "Other Attr", …],
-#     "COLUMN_DEFINITION": ["…def of ID…",    "…def of foo…", …],
-#     "EXAMPLE":           ["ID 12345",       "foo=bar",      …],
+#     "COLUMN_NAME":       ["Military ID", "Other Attr"],
+#     "COLUMN_DEFINITION": ["…",           "…"],
+#     "EXAMPLE":           ["ID 12345",    "foo=bar"],
 # })
 
-# 5a) get raw classifications
+# 5a) raw classification
 cls = df.apply(
     lambda r: classify_cid(
         r["COLUMN_NAME"],
@@ -145,11 +137,11 @@ cls = df.apply(
 )
 cls_df = pd.DataFrame(cls.tolist(), index=df.index)
 
-# 5b) merge back and map RAG
+# 5b) merge & RAG
 df = pd.concat([df, cls_df], axis=1)
 df["RAG_Category"] = df["CID category"].apply(map_rag_category)
 
-# 5c) generate human-readable justification
+# 5c) generate justifications
 df["Justification"] = df.apply(
     lambda r: justify_classification(
         r["COLUMN_NAME"],
@@ -162,8 +154,4 @@ df["Justification"] = df.apply(
     axis=1
 )
 
-# final df columns:
-# ["COLUMN_NAME","COLUMN_DEFINITION","EXAMPLE",
-#  "CID status","CID category","Attributes sub-category",
-#  "RAG_Category","Justification"]
 print(df.head())
