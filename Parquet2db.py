@@ -1,3 +1,69 @@
+
+import re
+
+def generate_postgres_partitioned_ddls(table_structures, partition_config):
+    """
+    Given:
+      table_structures: dict {tablename: multi-line string col-defs}
+      partition_config: dict {
+        tablename: {
+          'type': 'RANGE'|'LIST'|'HASH',
+          'columns': str or [str,...]
+        }, ...
+      }
+    Returns:
+      list of CREATE TABLE statements with PARTITION BY clauses.
+    """
+    table_ddls = {}
+
+    for table, struct in table_structures.items():
+        struct = struct.strip()
+        # strip wrapping parentheses if present
+        if struct.startswith('(') and struct.endswith(')'):
+            struct = struct[1:-1]
+
+        # split columns on commas that aren’t inside parens
+        cols = re.split(r',\s*(?![^()]*\))', struct)
+        col_defs = []
+        for col in cols:
+            col = col.strip()
+            if not col:
+                continue
+            # strip out SQL comments
+            if '--' in col:
+                col = col.split('--', 1)[0].strip()
+            if col:
+                col_defs.append(col)
+
+        # find partition info for this table
+        cfg = partition_config.get(table)
+        if not cfg:
+            raise ValueError(f"No partition config for table {table!r}")
+
+        ptype = cfg['type'].upper()
+        # ensure valid
+        if ptype not in ('RANGE','LIST','HASH'):
+            raise ValueError(f"Invalid partition type {ptype!r} for table {table!r}")
+
+        cols_part = cfg['columns']
+        if isinstance(cols_part, str):
+            cols_part = [cols_part]
+        cols_part = ", ".join(cols_part)
+
+        ddl = (
+            f"CREATE TABLE public.{table} (\n"
+            f"    " + ",\n    ".join(col_defs) + "\n"
+            f") PARTITION BY {ptype} ({cols_part});"
+        )
+
+        table_ddls[table] = ddl
+
+    return list(table_ddls.values())
+
+
+
+#############################################################################################################
+
 Thanks! I’ll prepare a complete Python script that:
 
 * Reads only the specified parquet files (A, B, C, D) from the Azure-mounted path `/mnt/data`.
