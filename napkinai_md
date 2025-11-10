@@ -1,0 +1,165 @@
+Yes, 100% we can tweak this idea to visualize GitLab Epics (parent/child) → full diagram instead of generic text prompts. That’s actually a super clean use case.
+
+Let me show you how it changes the design, and then I’ll give you 2–3 modified prompts tailored for the GitLab-epic version.
+
+How the idea changes for GitLab epics
+
+Instead of:
+
+user types free text → agents invent content → diagram
+
+We do:
+
+GitLab project/group → fetch epics/issues via API → agents structure & explain → diagram
+
+New high-level flow
+
+Data layer (GitLab API)
+
+You give:
+
+GitLab group ID / project ID / epic ID
+
+Personal Access Token (PAT)
+
+Backend (Python) calls:
+
+/groups/:id/epics or /projects/:id/issues etc.
+
+Build a structure like:
+
+{
+  "epic_id": 123,
+  "title": "Main Platform Rewrite",
+  "children": [
+    { "epic_id": 124, "title": "Backend", "children": [...] },
+    { "epic_id": 130, "title": "Frontend", "children": [...] }
+  ]
+}
+
+
+Agent pipeline (simplified roles)
+You might not even need 4 agents now. Example:
+
+Structure Agent
+
+Takes raw GitLab JSON and produces a clean tree/graph model with fields like id, title, status, weight, progress.
+
+Diagram Agent
+
+Converts that tree into Mermaid (or another diagram spec) e.g.:
+
+hierarchy view (parent → child)
+
+status color coding (Open / In Progress / Closed)
+
+Summary Agent (optional)
+
+Generates a short text summary of the epic tree: “This epic has 4 child epics, 12 issues, 70% closed…”
+
+Visualization layer
+
+Use Mermaid for:
+
+mindmap (epic → child epics → issues)
+
+or graph TD tree with links and labels.
+
+Frontend renders:
+
+Diagram of epics
+
+Side panel with summary, counts, etc.
+
+What changes in the stack?
+
+From the previous design, you mainly add:
+
+A small gitlab_client.py:
+
+Uses requests or httpx
+
+Reads GITLAB_BASE_URL + GITLAB_TOKEN from .env
+
+A new endpoint:
+
+GET /api/epic-visual/:epic_id
+or
+
+GET /api/group-visual/:group_id
+
+The rest (Azure OpenAI, FastAPI, Mermaid frontend, VS Code) stays the same.
+
+3 Modified Prompts (GitLab-epic flavor)
+
+You can reuse the earlier 10 prompts but here are three key ones rewritten specifically for GitLab epic visualisation.
+
+Prompt A – Design GitLab-specific Architecture
+
+You are a senior software architect.
+I want to build a VS-Code-first app that:
+
+Connects to GitLab using a Personal Access Token (PAT).
+
+Fetches epics and their parent/child relationships for a given group, project, or epic ID.
+
+Converts that structure into a visual diagram (Mermaid or similar) using Azure OpenAI agents.
+Please propose:
+
+A folder structure for a Python + FastAPI backend (gitlab_client.py, agents.py, pipeline.py, main.py, etc.).
+
+Which GitLab APIs to call (conceptually – I’ll fill in URLs and params).
+
+The core data model for an EpicNode tree (id, title, status, children, etc.).
+
+Prompt B – Define Agents for Epic → Diagram
+
+You are an LLM agent designer.
+I’m building a GitLab epic visualizer. I already fetch a nested JSON of epics and issues with parent/child relationships.
+I want 2–3 agents using Azure OpenAI:
+
+Structure Agent – cleans and normalizes the epic tree.
+
+Diagram Agent – converts the epic tree into Mermaid syntax (mindmap or graph) including status and assignee in node labels.
+
+Summary Agent (optional) – produces a brief textual overview of the epic hierarchy.
+For each agent, please give:
+
+Role/system prompt
+
+Expected input JSON schema
+
+Expected output JSON schema
+
+One example input and output.
+
+Prompt C – Build the Epic Visual Pipeline
+
+You are a Python backend engineer.
+Write a pipeline.py module that:
+
+Has a function build_epic_diagram(epic_tree: EpicNode) -> DiagramResult
+
+Internally calls the Structure Agent → Diagram Agent → Summary Agent (if defined).
+
+Returns a DiagramResult containing:
+
+Diagram type (e.g. "gitlab_epic_tree")
+
+Mermaid code string
+
+Summary text
+Use Pydantic models for EpicNode and DiagramResult.
+Assume Azure OpenAI client is already set up and imported as azure_client.
+Provide complete code for pipeline.py.
+
+To keep us moving and in “study mode”:
+
+👉 Quick check for you:
+How exactly do you imagine the final diagram to look for a single epic?
+
+Like a tree (root epic → child epics → issues)?
+
+Or like a flow (Idea → Epic → Tasks → Done)?
+
+Describe one concrete example (even rough text is fine), and then I can help you turn that into the exact Mermaid format + agent behavior.
